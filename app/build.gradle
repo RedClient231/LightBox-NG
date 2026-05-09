@@ -1,0 +1,103 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.jetbrains.kotlin.android)
+}
+
+android {
+    namespace 'com.lightbox.app'
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion = "27.2.12479018"
+
+    defaultConfig {
+        applicationId "com.lightbox.ng"
+        minSdk rootProject.ext.minSdk
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode rootProject.ext.versionCode
+        versionName rootProject.ext.versionName
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // ── Dual-ABI: one APK ships BOTH arm64-v8a and armeabi-v7a .so sets ──
+        //
+        // Why not split: the whole point of LightBox-NG is that ONE install
+        // handles both 32-bit and 64-bit virtual games, routed per-process by
+        // the Bcore proxy pool. The pool's :pN processes are forked by Android
+        // from whichever zygote matches the proxy's target ABI; shipping both
+        // .so sets is what enables that choice at fork time.
+        //
+        // No splits.abi{} block — we deliberately DO NOT want per-ABI split
+        // APKs. That would defeat the purpose.
+        ndk {
+            abiFilters "armeabi-v7a", "arm64-v8a"
+        }
+    }
+
+    // ── Deterministic signing ───────────────────────────────────────────
+    // Committed debug keystore so:
+    //   1. APKs from every CI run / local build are upgrade-compatible.
+    //   2. Side-by-side with stock LightBox (different applicationId + different
+    //      keystore) does NOT conflict at install time.
+    // Debug keystores have no security value; this is standard for
+    // multi-build-machine projects.
+    signingConfigs {
+        lightboxNgDebug {
+            storeFile rootProject.file('signing/lightbox-ng-debug.keystore')
+            storePassword 'lightboxng'
+            keyAlias 'lightbox-ng'
+            keyPassword 'lightboxng'
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.lightboxNgDebug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.lightboxNgDebug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        viewBinding true
+    }
+
+    // Android 11+ requires extractNativeLibs=true in the manifest for some
+    // ABI-routing scenarios. We rely on the default AGP behavior which matches
+    // the needs of the proxy pool; explicitly override via manifest if needed.
+
+    applicationVariants.configureEach { variant ->
+        variant.outputs.configureEach { output ->
+            output.outputFileName =
+                "LightBox-NG-${variant.versionName}-universal-${variant.buildType.name}.apk"
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+    implementation project(':Bcore')
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.constraintlayout
+    implementation libs.core.ktx
+
+    implementation 'androidx.recyclerview:recyclerview:1.2.1'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.3.1'
+    implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.3.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.3.1'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+}

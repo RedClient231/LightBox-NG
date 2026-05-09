@@ -1,0 +1,13 @@
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.jetbrains.kotlin.android) apply false
+    alias(libs.plugins.android.library) apply false
+}
+
+ext {
+    compileSdkVersion = 35
+    targetSdkVersion = 28
+    minSdk = 21
+    versionCode = 100
+    versionName = "1.0.0"
+}
