@@ -222,7 +222,7 @@ public class XapkInstaller {
             }
 
             // ── Step 2: Persist split APKs under <virtualAppDir>/splits/ ──
-            File virtualAppDir = BEnvironment.getDataAppPackageDirectory(packageName);
+            File virtualAppDir = BEnvironment.getAppDir(packageName);
             File splitDir = new File(virtualAppDir, "splits");
             if (!splitDir.exists() && !splitDir.mkdirs()) {
                 Log.w(TAG, "Could not create split dir: " + splitDir);
