@@ -542,6 +542,11 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                             app.setPackageName(pkg);
                             app.setAppName(nameIdx >= 0 && !c.isNull(nameIdx)
                                     ? c.getString(nameIdx) : pkg);
+                            // Every row from the helper's provider is, by
+                            // definition, owned by the helper. The launch
+                            // path uses this to dispatch without needing
+                            // to re-inspect the APK (which main can't see).
+                            app.setOwnedByHelper(true);
                             clonedApps.add(app);
                         }
                     } finally {
@@ -559,10 +564,25 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
 
     private void launchClonedApp(ClonedApp app) {
         try {
-            // Use the extracted native-lib dir, not just the APK path —
-            // for Unity games the APK has no libs and naive scanning says
-            // "pure Java", which would wrongly route a 32-bit game into
-            // the 64-bit main and repeat the Traffic Rider crash.
+            // Fast path: if the row came from the helper's InstalledGamesProvider,
+            // dispatch directly. Main's Bcore does not have this package, so
+            // any ABI inspection here would falsely conclude "no native libs"
+            // and route to IN_PROCESS_MAIN — which is how Traffic Rider died
+            // in M2.2: install worked, launch picked the wrong side.
+            if (app.isOwnedByHelper()) {
+                Log.i(TAG, "launchClonedApp: " + app.getPackageName()
+                        + " is helper-owned, dispatching to helper directly");
+                boolean launched = abiRouter.launchInHelper(app.getPackageName(), 0);
+                if (!launched) {
+                    Toast.makeText(this, getString(R.string.error_launch_failed),
+                            Toast.LENGTH_SHORT).show();
+                }
+                return;
+            }
+
+            // Main-owned virtual app: use the extracted native-lib dir,
+            // not just the APK path — for Unity games the APK has no libs
+            // and naive scanning says "pure Java".
             RealVirtualEngineBridge.VirtualPaths paths =
                     engineBridge.getVirtualPaths(app.getPackageName());
             boolean launched = abiRouter.launch(
@@ -601,7 +621,12 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 .setMessage(getString(R.string.confirm_uninstall_message, app.getAppName()))
                 .setPositiveButton(R.string.uninstall, (dialog, which) -> {
                     try {
-                        engineBridge.uninstallApp(app.getPackageName());
+                        // Route uninstall to whichever side owns the package.
+                        // Helper-owned rows must go through the bridge so the
+                        // helper's Bcore does the teardown — main's Bcore
+                        // doesn't know about these packages.
+                        abiRouter.dispatchUninstall(app.getPackageName(),
+                                app.isOwnedByHelper(), 0);
                         loadClonedApps();
                         Toast.makeText(this, getString(R.string.app_uninstalled),
                                 Toast.LENGTH_SHORT).show();

@@ -204,6 +204,20 @@ public final class AbiRouter {
         }
     }
 
+    /**
+     * Public entry point for dispatching a launch straight to the helper,
+     * skipping all ABI inspection. Used by the UI when the package is
+     * already known to be helper-owned (row came from the helper's
+     * InstalledGamesProvider). Returns false if the helper isn't installed.
+     */
+    public boolean launchInHelper(String virtualPackageName, int userId) {
+        if (!HelperPackage.isInstalled(ctx)) {
+            Log.w(TAG, "launchInHelper: helper not installed");
+            return false;
+        }
+        return launchViaHelper(virtualPackageName, userId);
+    }
+
     // ---------------------------------------------------------------------
     // Uninstall — send to whichever side owns the virtual package
     // ---------------------------------------------------------------------
