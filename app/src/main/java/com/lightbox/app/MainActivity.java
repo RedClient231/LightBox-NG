@@ -190,75 +190,15 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 }
 
                 if (looksLikeBundle) {
-                    // ABI-aware bundle routing: peek the bundle's split APKs.
-                    // Unity games (e.g., Traffic Rider) keep .so files in a
-                    // config.armeabi_v7a.apk split — the base APK looks
-                    // "pure Java" to a single-APK scan. peekBundle() scans
-                    // the splits too.
+                    // peekBundle() scans split APKs too — critical for
+                    // Unity games (e.g. Traffic Rider) whose base.apk has
+                    // no libs but config.armeabi_v7a.apk does. Without
+                    // peeking, the resolver would call the bundle
+                    // "pure Java" and route it to main.
                     VirtualAbiResolver.AbiInfo bundleAbi =
                             VirtualAbiResolver.peekBundle(stagedPath);
                     Log.i(TAG, "bundle abi: " + bundleAbi);
-                    if (bundleAbi.is32BitOnly()) {
-                        if (!HelperPackage.isInstalled(this)) {
-                            runOnUiThread(() -> promptInstallHelper(
-                                    displayName != null ? displayName : "this 32-bit game"));
-                            return;
-                        }
-                        // Stage into our own external cache (private to main on
-                        // Android 11+). We hand the helper a FileProvider URI
-                        // — its UID cannot read our private dir directly.
-                        String sharedStaging = stageBundleForHelper(stagedPath,
-                                displayName != null ? displayName : "bundle.xapk");
-                        if (sharedStaging == null) {
-                            runOnUiThread(() -> Toast.makeText(this,
-                                    getString(R.string.error_install_failed),
-                                    Toast.LENGTH_SHORT).show());
-                            return;
-                        }
-                        android.net.Uri bundleUri = null;
-                        try {
-                            bundleUri = androidx.core.content.FileProvider.getUriForFile(
-                                    this,
-                                    getPackageName() + ".helper_fileprovider",
-                                    new File(sharedStaging));
-                            // Broadcasts don't auto-carry URI perms; grant
-                            // explicitly to the helper package.
-                            grantUriPermission(HelperPackage.PACKAGE, bundleUri,
-                                    Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                        } catch (Exception e) {
-                            Log.e(TAG, "FileProvider URI build failed", e);
-                        }
-                        final android.net.Uri finalUri = bundleUri;
-                        final String finalStaging = sharedStaging;
-                        boolean dispatched = abiRouter.dispatchBundleInstallToHelper(
-                                finalStaging, finalUri,
-                                displayName != null ? displayName : "bundle.xapk",
-                                0);
-                        runOnUiThread(() -> Toast.makeText(this,
-                                dispatched
-                                        ? "Installing into 32-bit helper..."
-                                        : getString(R.string.error_install_failed),
-                                Toast.LENGTH_SHORT).show());
-                        // Don't delete the staged bundle — helper reads it
-                        // asynchronously. Helper cleans up after install.
-                        new File(stagedPath).delete();
-                        return;
-                    }
-
-                    XapkInstaller.Result result = xapkInstaller.install(stagedPath);
-                    runOnUiThread(() -> {
-                        if (result.success) {
-                            Toast.makeText(this,
-                                    getString(R.string.app_installed, result.appName),
-                                    Toast.LENGTH_SHORT).show();
-                            loadClonedApps();
-                        } else {
-                            Toast.makeText(this,
-                                    getString(R.string.error_install_failed_detail,
-                                            result.errorMessage),
-                                    Toast.LENGTH_LONG).show();
-                        }
-                    });
+                    installBundleByAbi(stagedPath, bundleAbi, displayName);
                     new File(stagedPath).delete();
                 } else {
                     installApkFromPath(stagedPath);
@@ -289,45 +229,44 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
             // the main (64-bit) sandbox works at install time but fails at launch
             // with the exact error we hit before: "libmain.so is 32-bit instead
             // of 64-bit".
+            // ABI-aware install routing. Cases:
+            //   32-bit-only  -> helper sandbox ONLY (dlopen of 32-bit .so
+            //                   into main's 64-bit :pN would crash at launch).
+            //   64-bit-only  -> main sandbox ONLY.
+            //   MIXED        -> BOTH. Unlocks GameGuardian: GG ships both
+            //                   ABIs, so installing in main lets it see
+            //                   arm64 games, and installing in helper lets
+            //                   it see armv7 games. GG can only instrument
+            //                   processes inside its own Bcore sandbox.
+            //   pure-Java    -> main sandbox ONLY (ABI irrelevant).
             VirtualAbiResolver.AbiInfo abi = VirtualAbiResolver.resolve(apkPath);
             Log.i(TAG, "install abi: " + abi);
 
-            if (abi.is32BitOnly()) {
+            boolean installInMain = abi.is64BitOnly() || abi.hasNoNative() || abi.isMixed();
+            boolean installInHelper = abi.is32BitOnly() || abi.isMixed();
+
+            if (installInHelper) {
                 if (!HelperPackage.isInstalled(this)) {
-                    runOnUiThread(() -> promptInstallHelper(info.appName));
-                    return;
+                    if (abi.is32BitOnly()) {
+                        runOnUiThread(() -> promptInstallHelper(info.appName));
+                        return;
+                    }
+                    // Mixed + helper missing: don't block. Fall through to
+                    // main-only install; user can sideload the helper later.
+                    Log.w(TAG, "mixed-ABI " + info.packageName
+                            + " -> helper-missing; installing into main only");
+                } else {
+                    dispatchSingleApkToHelper(apkPath, info.packageName, info.appName);
                 }
-                // Stage the APK somewhere the helper can read it. Main's
-                // private files dir is unreadable from another UID.
-                String sharedStaging = stageForHelper(apkPath, info.packageName);
-                if (sharedStaging == null) {
-                    runOnUiThread(() -> Toast.makeText(this,
-                            getString(R.string.error_install_failed),
-                            Toast.LENGTH_SHORT).show());
-                    return;
-                }
-                // Expose via FileProvider so the helper's UID can read it on
-                // Android 11+. See ACTION_INSTALL_BUNDLE flow for rationale.
-                android.net.Uri apkUri = null;
-                try {
-                    apkUri = androidx.core.content.FileProvider.getUriForFile(
-                            this,
-                            getPackageName() + ".helper_fileprovider",
-                            new File(sharedStaging));
-                    grantUriPermission(HelperPackage.PACKAGE, apkUri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                } catch (Exception e) {
-                    Log.e(TAG, "FileProvider URI build failed for single APK", e);
-                }
-                boolean dispatched = abiRouter.dispatchInstallToHelper(
-                        sharedStaging, apkUri, info.packageName + ".apk", 0);
+            }
+
+            if (installInMain) {
+                boolean success = installManager.installApk(apkPath);
                 runOnUiThread(() -> {
-                    if (dispatched) {
+                    if (success) {
                         Toast.makeText(this,
                                 getString(R.string.app_installed, info.appName),
                                 Toast.LENGTH_SHORT).show();
-                        // Helper notifies the content resolver on completion;
-                        // we reload proactively too.
                         loadClonedApps();
                     } else {
                         Toast.makeText(this,
@@ -335,27 +274,122 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                                 Toast.LENGTH_SHORT).show();
                     }
                 });
-                return;
             }
-
-            boolean success = installManager.installApk(apkPath);
-            runOnUiThread(() -> {
-                if (success) {
-                    Toast.makeText(this,
-                            getString(R.string.app_installed, info.appName),
-                            Toast.LENGTH_SHORT).show();
-                    loadClonedApps();
-                } else {
-                    Toast.makeText(this,
-                            getString(R.string.error_install_failed),
-                            Toast.LENGTH_SHORT).show();
-                }
-            });
         } catch (Exception e) {
             Log.e(TAG, "APK install failed", e);
             runOnUiThread(() -> Toast.makeText(this,
                     getString(R.string.error_install_failed_detail, e.getMessage()),
                     Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    /**
+     * Stage a single APK, build a FileProvider URI, grant it to the helper,
+     * and fire the install broadcast. Caller has already decided the helper
+     * should get this package.
+     */
+    private boolean dispatchSingleApkToHelper(String apkPath, String packageName,
+                                              String displayAppName) {
+        String sharedStaging = stageForHelper(apkPath, packageName);
+        if (sharedStaging == null) {
+            runOnUiThread(() -> Toast.makeText(this,
+                    getString(R.string.error_install_failed),
+                    Toast.LENGTH_SHORT).show());
+            return false;
+        }
+        android.net.Uri apkUri = null;
+        try {
+            apkUri = androidx.core.content.FileProvider.getUriForFile(
+                    this,
+                    getPackageName() + ".helper_fileprovider",
+                    new File(sharedStaging));
+            grantUriPermission(HelperPackage.PACKAGE, apkUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception e) {
+            Log.e(TAG, "FileProvider URI build failed (single APK)", e);
+        }
+        boolean dispatched = abiRouter.dispatchInstallToHelper(
+                sharedStaging, apkUri, packageName + ".apk", 0);
+        runOnUiThread(() -> {
+            if (dispatched) {
+                Toast.makeText(this,
+                        "Installing " + displayAppName + " (32-bit space)...",
+                        Toast.LENGTH_SHORT).show();
+                loadClonedApps();
+            } else {
+                Toast.makeText(this,
+                        getString(R.string.error_install_failed),
+                        Toast.LENGTH_SHORT).show();
+            }
+        });
+        return dispatched;
+    }
+
+    /**
+     * Bundle (XAPK/APKS/APKM) counterpart of {@link #installApkFromPath}.
+     * Same dual-install rules: 32-only -> helper, 64-only / pure-Java ->
+     * main, mixed -> both (enables the GameGuardian-in-helper workflow).
+     */
+    private void installBundleByAbi(String bundlePath, VirtualAbiResolver.AbiInfo abi,
+                                    String displayName) {
+        boolean installInMain = abi.is64BitOnly() || abi.hasNoNative() || abi.isMixed();
+        boolean installInHelper = abi.is32BitOnly() || abi.isMixed();
+        final String safeName = displayName != null ? displayName : "bundle.xapk";
+
+        if (installInHelper) {
+            if (!HelperPackage.isInstalled(this)) {
+                if (abi.is32BitOnly()) {
+                    runOnUiThread(() -> promptInstallHelper(safeName));
+                    return;
+                }
+                Log.w(TAG, "mixed-ABI bundle " + safeName
+                        + " -> helper-missing; installing into main only");
+            } else {
+                String sharedStaging = stageBundleForHelper(bundlePath, safeName);
+                if (sharedStaging != null) {
+                    android.net.Uri bundleUri = null;
+                    try {
+                        bundleUri = androidx.core.content.FileProvider.getUriForFile(
+                                this,
+                                getPackageName() + ".helper_fileprovider",
+                                new File(sharedStaging));
+                        grantUriPermission(HelperPackage.PACKAGE, bundleUri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    } catch (Exception e) {
+                        Log.e(TAG, "FileProvider URI build failed (bundle)", e);
+                    }
+                    final android.net.Uri finalUri = bundleUri;
+                    final String finalStaging = sharedStaging;
+                    boolean dispatched = abiRouter.dispatchBundleInstallToHelper(
+                            finalStaging, finalUri, safeName, 0);
+                    runOnUiThread(() -> Toast.makeText(this,
+                            dispatched
+                                    ? "Installing " + safeName + " (32-bit space)..."
+                                    : getString(R.string.error_install_failed),
+                            Toast.LENGTH_SHORT).show());
+                } else {
+                    runOnUiThread(() -> Toast.makeText(this,
+                            getString(R.string.error_install_failed),
+                            Toast.LENGTH_SHORT).show());
+                }
+            }
+        }
+
+        if (installInMain) {
+            XapkInstaller.Result result = xapkInstaller.install(bundlePath);
+            runOnUiThread(() -> {
+                if (result.success) {
+                    Toast.makeText(this,
+                            getString(R.string.app_installed, result.appName),
+                            Toast.LENGTH_SHORT).show();
+                    loadClonedApps();
+                } else {
+                    Toast.makeText(this,
+                            getString(R.string.error_install_failed_detail,
+                                    result.errorMessage),
+                            Toast.LENGTH_LONG).show();
+                }
+            });
         }
     }
 
@@ -518,14 +552,26 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
 
     private void loadClonedApps() {
         clonedApps.clear();
+        java.util.Set<String> mainPackages = new java.util.HashSet<>();
         try {
-            clonedApps.addAll(engineBridge.getInstalledApps());
+            java.util.List<ClonedApp> mainApps = engineBridge.getInstalledApps();
+            if (mainApps != null) {
+                for (ClonedApp a : mainApps) {
+                    if (a.getPackageName() != null) mainPackages.add(a.getPackageName());
+                }
+                clonedApps.addAll(mainApps);
+            }
         } catch (Exception e) {
             Log.e(TAG, "Failed to load cloned apps: " + e.getMessage(), e);
         }
         // Merge in 32-bit games installed inside the helper (Option A — one
         // unified library view). Soft-fail: if the helper isn't present or its
         // provider errors, we just show the 64-bit half.
+        //
+        // If the same package exists on BOTH sides (mixed-ABI install, e.g.
+        // GameGuardian), we keep both rows and disambiguate their labels so
+        // the user can tell which sandbox each instance belongs to and pick
+        // the right one when targeting a specific game.
         try {
             if (HelperPackage.isInstalled(this)) {
                 android.database.Cursor c = getContentResolver().query(
@@ -537,17 +583,32 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                         while (c.moveToNext()) {
                             String pkg = pkgIdx >= 0 ? c.getString(pkgIdx) : null;
                             if (pkg == null || pkg.isEmpty()) continue;
-                            com.lightbox.app.model.ClonedApp app =
+                            String rawName = (nameIdx >= 0 && !c.isNull(nameIdx))
+                                    ? c.getString(nameIdx) : pkg;
+                            boolean dualInstall = mainPackages.contains(pkg);
+
+                            // Helper row — always flagged for launch routing.
+                            com.lightbox.app.model.ClonedApp helperRow =
                                     new com.lightbox.app.model.ClonedApp();
-                            app.setPackageName(pkg);
-                            app.setAppName(nameIdx >= 0 && !c.isNull(nameIdx)
-                                    ? c.getString(nameIdx) : pkg);
-                            // Every row from the helper's provider is, by
-                            // definition, owned by the helper. The launch
-                            // path uses this to dispatch without needing
-                            // to re-inspect the APK (which main can't see).
-                            app.setOwnedByHelper(true);
-                            clonedApps.add(app);
+                            helperRow.setPackageName(pkg);
+                            helperRow.setAppName(dualInstall
+                                    ? rawName + " (32-bit space)"
+                                    : rawName);
+                            helperRow.setOwnedByHelper(true);
+                            clonedApps.add(helperRow);
+
+                            // If the package is ALSO in main, relabel the
+                            // main-side row we already added so the user
+                            // can tell them apart at a glance.
+                            if (dualInstall) {
+                                for (com.lightbox.app.model.ClonedApp a : clonedApps) {
+                                    if (!a.isOwnedByHelper()
+                                            && pkg.equals(a.getPackageName())) {
+                                        a.setAppName(a.getAppName() + " (64-bit space)");
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     } finally {
                         c.close();
