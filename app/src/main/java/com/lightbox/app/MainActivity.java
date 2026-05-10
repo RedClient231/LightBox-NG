@@ -202,11 +202,128 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
     private void installFromInstalled(String packageName) {
         try {
             ApplicationInfo appInfo = getPackageManager().getApplicationInfo(packageName, 0);
-            new Thread(() -> installApkFromPath(appInfo.sourceDir)).start();
+            final String baseApk = appInfo.sourceDir;
+            // Play Store apps are delivered as split APKs: base.apk + one or
+            // more config splits (per-ABI native libs, per-density resources,
+            // per-language resources) + feature splits. ApplicationInfo.sourceDir
+            // is ONLY the base.apk. For any game shipping arm64-v8a libs in a
+            // config.arm64_v8a.apk (UE4, large Unity, most modern 3D games),
+            // installing just the base leaves the virtual app with zero native
+            // libraries and it crashes on first dlopen. Example failure:
+            //   dlopen failed: library "libPluginCrosCurl.so" not found
+            // (Gangstar Mirage, seen on Walpad 10H Pro / Android 13 arm64).
+            //
+            // Fix: when splitSourceDirs is non-empty, rebundle all pieces into
+            // a temporary XAPK-shaped ZIP and dispatch through handleImportFile,
+            // which runs the existing XapkInstaller path. That path already
+            // extracts per-ABI .so files from config splits into the virtual
+            // lib dir via extractNativeLibsFromConfigSplit(). Single-APK games
+            // (splitSourceDirs == null/empty) keep the fast path unchanged —
+            // verified working for Hill Climb Racing on v1.0.1.
+            final String[] splits = appInfo.splitSourceDirs;
+            final String appLabel = getPackageManager()
+                    .getApplicationLabel(appInfo).toString();
+            new Thread(() -> {
+                if (splits == null || splits.length == 0) {
+                    installApkFromPath(baseApk);
+                    return;
+                }
+                String bundle = bundleInstalledSplitsToXapk(baseApk, splits, packageName);
+                if (bundle == null) {
+                    // Rebundle failed — at least try the base so pure-Java
+                    // apps still clone. Native games will crash on launch
+                    // as before, but the error surfaces rather than silently
+                    // installing an obviously-broken package.
+                    Log.w(TAG, "splits rebundle failed for " + packageName
+                            + ", falling back to base-only install");
+                    installApkFromPath(baseApk);
+                    return;
+                }
+                try {
+                    VirtualAbiResolver.AbiInfo abi =
+                            VirtualAbiResolver.peekBundle(bundle);
+                    Log.i(TAG, "cloned split-apk bundle abi: " + abi);
+                    installBundleByAbi(bundle, abi, appLabel + ".xapk");
+                } finally {
+                    //noinspection ResultOfMethodCallIgnored
+                    new File(bundle).delete();
+                }
+            }).start();
         } catch (PackageManager.NameNotFoundException e) {
             Log.e(TAG, "Package not found: " + packageName, e);
             Toast.makeText(this, getString(R.string.error_package_not_found), Toast.LENGTH_SHORT).show();
         }
+    }
+
+    /**
+     * Package base.apk + splits into a single XAPK-shaped ZIP so the existing
+     * {@link XapkInstaller} path can install it. The ZIP we produce follows the
+     * bundletool "apks" layout (splits/base-master.apk + splits/<name>.apk)
+     * because that's what {@link XapkInstaller#install} already handles without
+     * requiring a manifest.json.
+     *
+     * <p>Implementation notes:
+     * <ul>
+     *   <li>Staged inside {@code filesDir/apk_staging/} (same place as
+     *       copyUriToStaging), so it's covered by the existing cleanup paths
+     *       and available to the helper-dispatch flow via stageBundleForHelper.</li>
+     *   <li>We copy — not hard-link — because apkPath comes from
+     *       {@code /data/app/.../base.apk} which the app has read-only access
+     *       to; subsequent FileProvider/grantUriPermission calls need a file
+     *       under our own data dir.</li>
+     *   <li>Split names are preserved so config.arm64_v8a.apk /
+     *       config.armeabi_v7a.apk retain the naming
+     *       {@link XapkInstaller#extractNativeLibsFromConfigSplit} greps for.</li>
+     * </ul>
+     *
+     * @return absolute path to the created XAPK, or null on failure.
+     */
+    private String bundleInstalledSplitsToXapk(String baseApk, String[] splits,
+                                               String packageName) {
+        try {
+            File stagingDir = new File(getFilesDir(), "apk_staging");
+            if (!stagingDir.exists() && !stagingDir.mkdirs()) return null;
+            File out = new File(stagingDir,
+                    "cloned_" + packageName + "_"
+                            + System.currentTimeMillis() + ".xapk");
+
+            try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                    new java.io.BufferedOutputStream(new FileOutputStream(out)))) {
+                // Use STORED-equivalent compression=false? DEFLATED is fine — the
+                // splits are already compressed APKs so ZIP compression is
+                // ~free. STORED would need pre-computed CRC+size per entry.
+                zos.setLevel(java.util.zip.Deflater.NO_COMPRESSION);
+                writeApkEntry(zos, "splits/base-master.apk", new File(baseApk));
+                for (String splitPath : splits) {
+                    if (splitPath == null) continue;
+                    File sf = new File(splitPath);
+                    if (!sf.exists() || !sf.canRead()) {
+                        Log.w(TAG, "skipping unreadable split: " + splitPath);
+                        continue;
+                    }
+                    // Preserve the split filename so XapkInstaller's
+                    // "starts with config." / "contains .config." heuristics
+                    // still classify it correctly.
+                    String name = "splits/" + sf.getName();
+                    writeApkEntry(zos, name, sf);
+                }
+            }
+            return out.getAbsolutePath();
+        } catch (Exception e) {
+            Log.e(TAG, "bundleInstalledSplitsToXapk failed: " + e.getMessage(), e);
+            return null;
+        }
+    }
+
+    private static void writeApkEntry(java.util.zip.ZipOutputStream zos,
+                                      String entryName, File src) throws java.io.IOException {
+        zos.putNextEntry(new java.util.zip.ZipEntry(entryName));
+        try (InputStream in = new java.io.FileInputStream(src)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) zos.write(buf, 0, n);
+        }
+        zos.closeEntry();
     }
 
     private void handleImportUri(Uri uri) {
