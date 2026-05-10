@@ -24,6 +24,12 @@ public class BPackageSettings implements Parcelable {
     public Map<Integer, BPackageUserState> userState = new HashMap<>();
     static final BPackageUserState DEFAULT_USER_STATE = new BPackageUserState();
 
+    /** Absolute paths of selected split APKs persisted under blackbox/data/app/<pkg>/splits. */
+    public ArrayList<String> splitCodePaths = new ArrayList<>();
+
+    /** Optional split names in the same order as splitCodePaths. */
+    public ArrayList<String> splitNames = new ArrayList<>();
+
     public BPackageSettings() {
     }
 
@@ -124,6 +130,8 @@ public class BPackageSettings implements Parcelable {
             dest.writeValue(entry.getKey());
             dest.writeParcelable(entry.getValue(), flags);
         }
+        dest.writeStringList(this.splitCodePaths);
+        dest.writeStringList(this.splitNames);
     }
 
     protected BPackageSettings(Parcel in) {
@@ -137,6 +145,10 @@ public class BPackageSettings implements Parcelable {
             BPackageUserState value = in.readParcelable(BPackageUserState.class.getClassLoader());
             this.userState.put(key, value);
         }
+        this.splitCodePaths = in.createStringArrayList();
+        if (this.splitCodePaths == null) this.splitCodePaths = new ArrayList<>();
+        this.splitNames = in.createStringArrayList();
+        if (this.splitNames == null) this.splitNames = new ArrayList<>();
     }
 
     public static final Creator<BPackageSettings> CREATOR = new Creator<BPackageSettings>() {

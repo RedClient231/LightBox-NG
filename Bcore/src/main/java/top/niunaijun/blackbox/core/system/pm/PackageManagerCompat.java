@@ -16,7 +16,9 @@ import android.content.pm.ServiceInfo;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.os.Build;
+import android.util.Log;
 
+import java.io.File;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -306,6 +308,17 @@ public class PackageManagerCompat {
         ai.sourceDir = sourceDir;
         ai.uid = p.mExtras.appId;
 
+        // Populate split APK paths from BPackageSettings for virtual apps
+        if (p.mExtras.splitCodePaths != null && !p.mExtras.splitCodePaths.isEmpty()) {
+            String[] splitArray = p.mExtras.splitCodePaths.toArray(new String[0]);
+            ai.splitSourceDirs = splitArray;
+            ai.splitPublicSourceDirs = splitArray;
+            if (BuildCompat.isL()) {
+                BRApplicationInfoL.get(ai)._set_splitPublicSourceDirs(splitArray);
+                BRApplicationInfoL.get(ai)._set_splitSourceDirs(splitArray);
+            }
+        }
+
 
         if (BuildCompat.isL()) {
             BRApplicationInfoL.get(ai)._set_primaryCpuAbi(Build.CPU_ABI);
@@ -369,6 +382,28 @@ public class PackageManagerCompat {
         if (ps != null) {
             AssetManager assets = BRAssetManager.get()._new();
             BRAssetManager.get(assets).addAssetPath(ps.pkg.baseCodePath);
+
+            // Mount split APK asset paths so resources from splits are visible
+            if (ps.splitCodePaths != null && !ps.splitCodePaths.isEmpty()) {
+                for (String splitPath : ps.splitCodePaths) {
+                    if (splitPath == null) continue;
+                    File f = new File(splitPath);
+                    if (!f.isFile()) {
+                        Log.w("PackageManagerCompat", "Skipping missing split asset path for "
+                                + appInfo.packageName + ": " + splitPath);
+                        continue;
+                    }
+                    Integer cookie = BRAssetManager.get(assets).addAssetPath(splitPath);
+                    if (cookie == null || cookie == 0) {
+                        Log.w("PackageManagerCompat", "AssetManager rejected split path for "
+                                + appInfo.packageName + ": " + splitPath);
+                    } else {
+                        Log.i("PackageManagerCompat", "Mounted split asset path for "
+                                + appInfo.packageName + ": " + splitPath);
+                    }
+                }
+            }
+
             Resources hostRes = context.getResources();
             return new Resources(assets, hostRes.getDisplayMetrics(), hostRes.getConfiguration());
         }

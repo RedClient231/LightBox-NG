@@ -3,6 +3,7 @@ package top.niunaijun.blackbox.app.dispatcher;
 import android.app.job.JobParameters;
 import android.app.job.JobService;
 import android.content.res.Configuration;
+import android.util.Log;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -84,13 +85,19 @@ public class AppJobServiceDispatcher {
             }
             try {
                 JobRecord record = BlackBoxCore.getBJobManager().queryJobRecord(BlackBoxCore.getAppProcessName(), jobId);
+                if (record == null || record.mServiceInfo == null) {
+                    Log.w("AppJobServiceDispatcher", "No JobRecord/ServiceInfo for jobId=" + jobId
+                            + "; stopping job dispatch safely");
+                    return null;
+                }
                 record.mJobService = BlackBoxCore.currentActivityThread().createJobService(record.mServiceInfo);
                 if (record.mJobService == null)
                     return null;
                 mJobRecords.put(jobId, record);
                 return record.mJobService;
             } catch (Throwable t) {
-                t.printStackTrace();
+                Log.w("AppJobServiceDispatcher", "getJobService failed for jobId=" + jobId
+                        + ": " + t.getMessage());
             }
             return null;
         }

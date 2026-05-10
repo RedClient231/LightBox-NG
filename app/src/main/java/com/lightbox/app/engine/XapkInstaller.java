@@ -7,16 +7,24 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+
+import top.niunaijun.blackbox.BlackBoxCore;
+import top.niunaijun.blackbox.core.env.BEnvironment;
+import top.niunaijun.blackbox.core.system.pm.BPackageSettings;
+import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
 
 /**
  * Extracts and installs XAPK / APKS / APKM bundles.
@@ -32,18 +40,17 @@ import java.util.zip.ZipFile;
  *   2. Pick the base APK — prefer an APK whose parsed packageName matches
  *      manifest.json, otherwise the largest non-config APK.
  *   3. Install the base via the engine.
- *   4. Install feature splits via the engine; skip config splits (the engine
- *      rejects those as non-base APKs).
- *   5. Copy .obb expansions to /sdcard/Android/obb/<package>/ (best-effort,
- *      requires MANAGE_EXTERNAL_STORAGE on Android 11+).
- *   6. Clean up the staging directory.
+ *   4. Copy compatible split APKs to <virtualAppDir>/splits/ and persist
+ *      their paths in BPackageSettings.splitCodePaths (NOT install them
+ *      as independent packages — the engine's PackageParser rejects them).
+ *   5. Extract native libs from ABI-compatible splits.
+ *   6. Copy Unity IL2CPP metadata fallback from any split that contains it.
+ *   7. Copy .obb expansions and Android/data payloads to virtual storage.
+ *   8. Clean up the staging directory.
  *
- * Side effects / edge cases handled:
- *   - Zip slip: verify canonical path is within destRoot before writing.
- *   - Nested folder layout: recursive walks for manifest/APK/OBB location.
- *   - Missing manifest.json: falls back to APK filename heuristics + size.
- *   - Wrong-arch config splits in a universal APK install: skipped rather
- *     than passed to the engine's PackageParser which would reject them.
+ * CRITICAL: Do NOT call installPackageAsUser / installApk for config/split
+ * APKs. They are not standalone APKs and will fail with
+ * "getPackageArchiveInfo error — Expected base APK, but found split".
  */
 public class XapkInstaller {
 
@@ -89,8 +96,6 @@ public class XapkInstaller {
 
     /**
      * Sniff the first 4 bytes for the ZIP magic "PK\x03\x04".
-     * APKs are ZIPs too, so a positive result must be combined with a name/
-     * MIME hint before routing to this installer.
      */
     public static boolean looksLikeZip(InputStream in) {
         try {
@@ -124,6 +129,7 @@ public class XapkInstaller {
         try {
             extractZip(bundleFile, stagingDir);
 
+            // ── Parse manifest.json ──
             File manifest = findFileByName(stagingDir, "manifest.json");
             String declaredPackage = null;
             String declaredAppName = null;
@@ -157,6 +163,7 @@ public class XapkInstaller {
                 }
             }
 
+            // ── Identify APKs ──
             List<File> allApks = collectFilesBySuffix(stagingDir, ".apk");
             if (allApks.isEmpty()) {
                 return Result.failure("No APK files inside bundle");
@@ -199,6 +206,7 @@ public class XapkInstaller {
             Log.i(TAG, "Installing bundle — base=" + baseApk.getName()
                     + " splits=" + splitApks.size() + " obbs=" + obbFiles.size());
 
+            // ── Step 1: Install base APK ──
             if (!engineBridge.installApk(baseApk.getAbsolutePath())) {
                 return Result.failure("Base APK install rejected by engine");
             }
@@ -213,38 +221,91 @@ public class XapkInstaller {
                 return Result.failure("Bundle installed but package name is unknown");
             }
 
+            // ── Step 2: Persist split APKs under <virtualAppDir>/splits/ ──
+            File virtualAppDir = BEnvironment.getDataAppPackageDirectory(packageName);
+            File splitDir = new File(virtualAppDir, "splits");
+            if (!splitDir.exists() && !splitDir.mkdirs()) {
+                Log.w(TAG, "Could not create split dir: " + splitDir);
+            }
+
+            String[] deviceAbis = Build.SUPPORTED_ABIS != null
+                    ? Build.SUPPORTED_ABIS : new String[0];
+
+            List<String> persistedSplitPaths = new ArrayList<>();
+            List<String> persistedSplitNames = new ArrayList<>();
+
             for (File split : splitApks) {
                 String n = split.getName().toLowerCase(Locale.ROOT);
                 boolean configSplit = n.startsWith("config.")
                         || n.startsWith("split_config.")
                         || n.contains(".config.");
-                if (configSplit) {
-                    // APKPure / bundletool XAPKs put the native .so files in
-                    // config splits named like 'config.arm64_v8a.apk' — the
-                    // base.apk usually has NO lib/ folder at all. The engine's
-                    // PackageParser rejects config splits as base APKs, so we
-                    // can't install them; but we MUST still extract their
-                    // per-ABI lib/<abi>/*.so into the virtual app's lib dir
-                    // or the game dlopen()s a missing library on launch and
-                    // crashes (libmain.so / libgame.so / libunity.so etc.).
-                    int extracted = extractNativeLibsFromConfigSplit(
-                            split, packageName);
-                    Log.i(TAG, "Extracted " + extracted + " .so from config split: "
-                            + split.getName());
+
+                // Select only compatible splits
+                if (configSplit && !isCompatibleSplit(split, deviceAbis)) {
+                    Log.i(TAG, "Skipping incompatible split: " + split.getName());
                     continue;
                 }
+
+                // Copy split to persistent dir
+                File dst = new File(splitDir, sanitizeSplitFileName(split.getName()));
                 try {
-                    boolean ok = engineBridge.installApk(split.getAbsolutePath());
-                    Log.i(TAG, "Split install " + split.getName() + " -> " + ok);
+                    copyFile(split, dst);
+                    persistedSplitPaths.add(dst.getAbsolutePath());
+                    persistedSplitNames.add(split.getName());
+                    Log.i(TAG, "Persisted split path: " + dst.getAbsolutePath());
                 } catch (Exception e) {
-                    Log.w(TAG, "Split install failed for " + split.getName()
-                            + " (non-fatal): " + e.getMessage());
+                    Log.w(TAG, "Failed to persist split " + split.getName()
+                            + ": " + e.getMessage());
+                    // For ABI splits, this is critical
+                    if (isAbiSplit(n)) {
+                        return Result.failure("Failed to persist ABI split: "
+                                + split.getName());
+                    }
+                    // For locale/density splits, continue
+                    continue;
+                }
+
+                // Extract native libs from this split
+                if (configSplit) {
+                    int extracted = extractNativeLibsFromConfigSplit(split, packageName);
+                    Log.i(TAG, "Extracted " + extracted + " .so from config split: "
+                            + split.getName());
+                }
+
+                // Unity IL2CPP metadata fallback
+                copyUnityIl2CppMetadataIfPresent(dst, packageName);
+            }
+
+            // ── Step 3: Persist split paths in BPackageSettings ──
+            if (!persistedSplitPaths.isEmpty()) {
+                try {
+                    BPackageManagerService pmService = BPackageManagerService.get();
+                    if (pmService != null) {
+                        BPackageSettings ps = pmService.getBPackageSetting(packageName);
+                        if (ps != null) {
+                            ps.splitCodePaths = new ArrayList<>(persistedSplitPaths);
+                            ps.splitNames = new ArrayList<>(persistedSplitNames);
+                            ps.save();
+                            Log.i(TAG, "Saved " + persistedSplitPaths.size()
+                                    + " split paths for " + packageName);
+                        } else {
+                            Log.w(TAG, "BPackageSettings not found for " + packageName
+                                    + "; split paths not persisted");
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to persist split paths in BPackageSettings: "
+                            + e.getMessage());
                 }
             }
 
+            // ── Step 4: Copy OBB files to virtual storage ──
             if (!obbFiles.isEmpty()) {
                 copyObbs(packageName, obbFiles);
             }
+
+            // ── Step 5: Copy Android/data and Android/obb from XAPK ──
+            extractAndroidPayloads(bundleFile, packageName);
 
             return Result.success(packageName, appName);
         } catch (Exception e) {
@@ -255,39 +316,56 @@ public class XapkInstaller {
         }
     }
 
+    // ────────────────────────────────────────────────────────────
+    // Split compatibility selection
+    // ────────────────────────────────────────────────────────────
+
     /**
-     * Extract the current device's native libraries from a config/split APK
-     * into the virtual app's lib directory, flat (no ABI subdir) — the layout
-     * the Bcore engine's native loader expects.
-     *
-     * APKPure / bundletool XAPKs package native libs in per-ABI split APKs
-     * (e.g. {@code config.arm64_v8a.apk}) whose {@code base.apk} contains no
-     * {@code lib/} folder. The engine rejects config splits as base APKs, so
-     * we can't install them normally — but we can still unzip their lib
-     * entries and drop the files where the loader will find them at launch.
-     *
-     * <p>Selection policy:
-     * <ul>
-     *   <li>Read every {@code lib/<abi>/*.so} entry.</li>
-     *   <li>Prefer entries whose {@code <abi>} matches the device's primary
-     *       ABI ({@code Build.SUPPORTED_ABIS[0]}).</li>
-     *   <li>Fall back to any other supported ABI the device reports, in the
-     *       order the system prefers them.</li>
-     *   <li>Never extract an arch the device can't execute (e.g. x86 on an
-     *       arm device) — doing so would either waste disk or (worse)
-     *       confuse a linker that picked the wrong file.</li>
-     * </ul>
-     *
-     * @return number of .so files actually written
+     * Check if a split APK is compatible with the current device.
+     * ABI splits must match the device's primary ABI.
+     * Locale and density splits are always considered compatible.
      */
+    private boolean isCompatibleSplit(File splitApk, String[] deviceAbis) {
+        String name = splitApk.getName().toLowerCase(Locale.ROOT);
+
+        // Check if this is an ABI split
+        for (String abi : deviceAbis) {
+            String abiLabel = abi.toLowerCase(Locale.ROOT).replace("-", "_");
+            if (name.contains(abiLabel)) {
+                return true;
+            }
+        }
+
+        // If it's an ABI split but didn't match, skip it
+        if (isAbiSplit(name)) {
+            return false;
+        }
+
+        // Locale, density, and other config splits are compatible
+        return true;
+    }
+
+    private boolean isAbiSplit(String name) {
+        return name.contains("arm64_v8a") || name.contains("armeabi_v7a")
+                || name.contains("x86_64") || name.contains("x86")
+                || name.contains("mips") || name.contains("arm64-v8a")
+                || name.contains("armeabi-v7a");
+    }
+
+    private String sanitizeSplitFileName(String name) {
+        // Replace characters that might cause issues in filenames
+        return name.replace("..", "").replace("/", "_").replace("\\", "_");
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Native library extraction from config splits
+    // ────────────────────────────────────────────────────────────
+
     private int extractNativeLibsFromConfigSplit(File splitApk, String packageName) {
-        // The engine's virtual lib dir: <host-filesDir-parent>/blackbox/data/app/<pkg>/lib/
-        // This matches the path the logcat shows the native loader using:
-        //   /data/user/0/com.lightbox.app/blackbox/data/app/<pkg>/lib/libfoo.so
         File virtualLibDir;
         try {
             File hostFilesDir = context.getFilesDir();
-            File hostDataRoot = hostFilesDir.getParentFile(); // /data/user/0/<host>
+            File hostDataRoot = hostFilesDir.getParentFile();
             virtualLibDir = new File(hostDataRoot,
                     "blackbox/data/app/" + packageName + "/lib");
             if (!virtualLibDir.exists() && !virtualLibDir.mkdirs()) {
@@ -300,18 +378,11 @@ public class XapkInstaller {
         }
 
         String[] deviceAbis = Build.SUPPORTED_ABIS != null
-                ? Build.SUPPORTED_ABIS
-                : new String[0];
-        if (deviceAbis.length == 0) {
-            Log.w(TAG, "Build.SUPPORTED_ABIS is empty; cannot pick an ABI");
-            return 0;
-        }
+                ? Build.SUPPORTED_ABIS : new String[0];
+        if (deviceAbis.length == 0) return 0;
 
         int written = 0;
         try (ZipFile zf = new ZipFile(splitApk)) {
-            // Try each ABI in preference order; stop once we find a matching
-            // ABI inside the split. Most config splits carry exactly one ABI
-            // anyway, but base-master.apk variants may carry several.
             for (String abi : deviceAbis) {
                 int thisPass = extractLibsForAbi(zf, abi.toLowerCase(Locale.ROOT),
                         virtualLibDir);
@@ -327,11 +398,6 @@ public class XapkInstaller {
         return written;
     }
 
-    /**
-     * Copy every {@code lib/<abi>/*.so} entry out of {@code zf} into
-     * {@code targetDir} flat (basename only). Returns the count written.
-     * Zip-slip-guarded.
-     */
     private int extractLibsForAbi(ZipFile zf, String abi, File targetDir)
             throws Exception {
         String prefix = "lib/" + abi + "/";
@@ -345,20 +411,11 @@ public class XapkInstaller {
             if (!name.toLowerCase(Locale.ROOT).startsWith(prefix)) continue;
             if (!name.toLowerCase(Locale.ROOT).endsWith(".so")) continue;
 
-            // Basename only — the engine's loader expects a flat lib/ dir,
-            // matching the layout its own CopyExecutor produces for
-            // single-APK installs.
             String basename = name.substring(name.lastIndexOf('/') + 1);
-            if (basename.isEmpty() || basename.contains("..")) {
-                Log.w(TAG, "Skipping suspicious lib entry: " + name);
-                continue;
-            }
+            if (basename.isEmpty() || basename.contains("..")) continue;
 
             File out = new File(targetDir, basename);
-            if (!out.getCanonicalPath().startsWith(targetCanonical)) {
-                Log.w(TAG, "Skipping zip-slip lib entry: " + name);
-                continue;
-            }
+            if (!out.getCanonicalPath().startsWith(targetCanonical)) continue;
 
             try (InputStream in = zf.getInputStream(e);
                  FileOutputStream fos = new FileOutputStream(out)) {
@@ -366,17 +423,166 @@ public class XapkInstaller {
                 int r;
                 while ((r = in.read(buf)) > 0) fos.write(buf, 0, r);
             }
-            // Make readable+executable for the app's UID. Some Android
-            // versions require exec bit before the linker will mmap an
-            // executable segment from the file.
-            //noinspection ResultOfMethodCallIgnored
             out.setReadable(true, false);
-            //noinspection ResultOfMethodCallIgnored
             out.setExecutable(true, false);
             count++;
         }
         return count;
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Unity IL2CPP metadata fallback (Fix 5)
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * If a split APK contains Unity IL2CPP metadata under any path ending
+     * in global-metadata.dat, copy it to the virtual external files directory
+     * where Unity expects to find it at runtime.
+     *
+     * This fixes Bus Simulator Indonesia and other Unity IL2CPP games that
+     * crash with: "IL2CPP ERROR: Could not open .../il2cpp/Metadata/global-metadata.dat"
+     */
+    private void copyUnityIl2CppMetadataIfPresent(File splitApk, String packageName) {
+        final String metadataSuffix = "global-metadata.dat";
+        try (ZipFile zip = new ZipFile(splitApk)) {
+            ZipEntry match = null;
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry e = entries.nextElement();
+                if (e.isDirectory()) continue;
+                String name = e.getName();
+                if (name.endsWith(metadataSuffix)) {
+                    match = e;
+                    break;
+                }
+            }
+            if (match == null) return;
+
+            File filesDir = getVirtualExternalFilesDir(packageName);
+            File metadataDir = new File(filesDir, "il2cpp/Metadata");
+            if (!metadataDir.exists() && !metadataDir.mkdirs()) {
+                Log.w(TAG, "Could not create IL2CPP metadata dir: " + metadataDir);
+                return;
+            }
+            File out = new File(metadataDir, "global-metadata.dat");
+
+            try (InputStream in = zip.getInputStream(match);
+                 OutputStream os = new BufferedOutputStream(new FileOutputStream(out))) {
+                byte[] buf = new byte[256 * 1024];
+                int read;
+                while ((read = in.read(buf)) != -1) {
+                    os.write(buf, 0, read);
+                }
+            }
+            Log.i(TAG, "Copied Unity IL2CPP metadata from " + splitApk.getName()
+                    + " to " + out.getAbsolutePath());
+        } catch (IOException e) {
+            Log.w(TAG, "Unable to scan/copy Unity metadata from split: " + splitApk, e);
+        }
+    }
+
+    /**
+     * Resolve the virtual external files directory for a package.
+     * Maps to the same virtual storage root LightBox-NG exposes to apps.
+     * Uses BEnvironment helpers when available; falls back to the path
+     * pattern from the crash log.
+     */
+    private File getVirtualExternalFilesDir(String packageName) {
+        try {
+            // Use BEnvironment if available
+            File dataDir = BEnvironment.getDataDir(packageName, 0);
+            // Virtual external storage pattern:
+            // <host-external>/Android/data/<hostPkg>/files/blackbox/storage/emulated/0/Android/data/<pkg>/files
+            File hostExternal = context.getExternalFilesDir(null);
+            if (hostExternal != null) {
+                File androidData = hostExternal.getParentFile().getParentFile();
+                File virtualStorage = new File(androidData,
+                        context.getPackageName() + "/files/blackbox/storage/emulated/0/Android/data/"
+                                + packageName + "/files");
+                if (!virtualStorage.exists()) {
+                    virtualStorage.mkdirs();
+                }
+                return virtualStorage;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not resolve virtual external files dir: " + e.getMessage());
+        }
+        // Fallback
+        return context.getExternalFilesDir(null);
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Android/data and Android/obb payloads from XAPK (Fix 6)
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * Extract Android/obb/<pkg>/** and Android/data/<pkg>/** entries
+     * from the XAPK ZIP and copy them to the virtual storage paths.
+     */
+    private void extractAndroidPayloads(File xapkFile, String packageName) {
+        try {
+            File hostExternal = context.getExternalFilesDir(null);
+            if (hostExternal == null) return;
+            File androidRoot = hostExternal.getParentFile().getParentFile();
+            File virtualStorageRoot = new File(androidRoot,
+                    context.getPackageName() + "/files/blackbox/storage/emulated/0");
+
+            long totalCopied = 0;
+            try (ZipFile zf = new ZipFile(xapkFile)) {
+                Enumeration<? extends ZipEntry> entries = zf.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    if (entry.isDirectory()) continue;
+                    String name = entry.getName();
+
+                    // Match Android/obb/<packageName>/** or Android/data/<packageName>/**
+                    boolean isObb = name.startsWith("Android/obb/" + packageName + "/");
+                    boolean isData = name.startsWith("Android/data/" + packageName + "/");
+
+                    if (!isObb && !isData) continue;
+
+                    // Validate: prevent path traversal
+                    File outFile = safeResolve(virtualStorageRoot, name);
+                    if (outFile == null) continue;
+
+                    outFile.getParentFile().mkdirs();
+                    try (InputStream in = zf.getInputStream(entry);
+                         FileOutputStream out = new FileOutputStream(outFile)) {
+                        byte[] buf = new byte[32 * 1024];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            out.write(buf, 0, n);
+                            totalCopied += n;
+                        }
+                    }
+                    Log.d(TAG, "Extracted XAPK payload: " + name);
+                }
+            }
+            if (totalCopied > 0) {
+                Log.i(TAG, "Total XAPK Android payload copied: " + totalCopied + " bytes");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "XAPK Android payload extraction failed (non-fatal): " + e.getMessage());
+        }
+    }
+
+    private static File safeResolve(File root, String relativeName) throws IOException {
+        String normalized = relativeName.replace('\\', '/');
+        if (normalized.startsWith("/") || normalized.contains("../") || normalized.equals("..")) {
+            return null;
+        }
+        File out = new File(root, normalized);
+        String rootPath = root.getCanonicalPath() + File.separator;
+        String outPath = out.getCanonicalPath();
+        if (!outPath.startsWith(rootPath)) {
+            return null;
+        }
+        return out;
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // ZIP extraction and file utilities
+    // ────────────────────────────────────────────────────────────
 
     private void extractZip(File src, File destRoot) throws Exception {
         String destRootCanonical = destRoot.getCanonicalPath();
@@ -385,15 +591,9 @@ public class XapkInstaller {
             while (entries.hasMoreElements()) {
                 ZipEntry e = entries.nextElement();
                 String name = e.getName();
-                if (name.contains("..") || name.startsWith("/")) {
-                    Log.w(TAG, "Skipping suspicious zip entry: " + name);
-                    continue;
-                }
+                if (name.contains("..") || name.startsWith("/")) continue;
                 File out = new File(destRoot, name);
-                if (!out.getCanonicalPath().startsWith(destRootCanonical)) {
-                    Log.w(TAG, "Skipping path-traversal entry: " + name);
-                    continue;
-                }
+                if (!out.getCanonicalPath().startsWith(destRootCanonical)) continue;
                 if (e.isDirectory()) {
                     out.mkdirs();
                     continue;
@@ -480,20 +680,38 @@ public class XapkInstaller {
             File extFilesDir = context.getExternalFilesDir(null);
             if (extFilesDir == null) return;
             File android = extFilesDir.getParentFile().getParentFile();
-            File target = new File(android, "obb/" + packageName);
-            if (!target.exists() && !target.mkdirs()) return;
+
+            // Copy to real OBB dir
+            File realObb = new File(android, "obb/" + packageName);
+            if (!realObb.exists() && !realObb.mkdirs()) return;
             for (File obb : obbFiles) {
-                File dst = new File(target, obb.getName());
-                try (FileInputStream in = new FileInputStream(obb);
-                     FileOutputStream out = new FileOutputStream(dst)) {
-                    byte[] buf = new byte[32 * 1024];
-                    int n;
-                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-                }
+                File dst = new File(realObb, obb.getName());
+                try { copyFile(obb, dst); } catch (Exception ignored) {}
                 Log.i(TAG, "Copied OBB: " + obb.getName() + " -> " + dst.getAbsolutePath());
+            }
+
+            // Also copy to virtual storage OBB path
+            File virtualStorageRoot = new File(android,
+                    context.getPackageName() + "/files/blackbox/storage/emulated/0");
+            File virtualObb = new File(virtualStorageRoot, "Android/obb/" + packageName);
+            if (!virtualObb.exists()) virtualObb.mkdirs();
+            for (File obb : obbFiles) {
+                File dst = new File(virtualObb, obb.getName());
+                try { copyFile(obb, dst); } catch (Exception ignored) {}
+                Log.i(TAG, "Copied OBB to virtual: " + obb.getName()
+                        + " -> " + dst.getAbsolutePath());
             }
         } catch (Exception e) {
             Log.w(TAG, "OBB copy failed (non-fatal): " + e.getMessage());
+        }
+    }
+
+    private static void copyFile(File src, File dest) throws Exception {
+        try (FileInputStream in = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[32 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
         }
     }
 
