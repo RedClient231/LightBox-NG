@@ -89,6 +89,41 @@ public class RealVirtualEngineBridge {
     }
 
     /**
+     * Lightweight POJO carrying both the virtual APK path and the extracted
+     * native-lib dir for a given virtual package. Either field may be null
+     * if the engine can't resolve it.
+     */
+    public static final class VirtualPaths {
+        public final String apkPath;
+        public final String nativeLibDir;
+        public VirtualPaths(String apkPath, String nativeLibDir) {
+            this.apkPath = apkPath;
+            this.nativeLibDir = nativeLibDir;
+        }
+    }
+
+    /**
+     * Return BOTH the on-disk APK and the extracted nativeLibraryDir for a
+     * virtual package. AbiRouter needs the lib dir because some APKs (e.g.
+     * Unity games) carry their .so files in split APKs — the base APK has
+     * no libs and a naive lib-scan calls them "pure Java", which leads to
+     * routing a 32-bit game into the 64-bit main.
+     */
+    public VirtualPaths getVirtualPaths(String packageName) {
+        try {
+            int userId = getOrCreateDefaultUser();
+            android.content.pm.ApplicationInfo info =
+                    BlackBoxCore.getBPackageManager()
+                            .getApplicationInfo(packageName, 0, userId);
+            if (info == null) return new VirtualPaths(null, null);
+            return new VirtualPaths(info.sourceDir, info.nativeLibraryDir);
+        } catch (Exception e) {
+            Log.w(TAG, "getVirtualPaths failed for " + packageName + ": " + e.getMessage());
+            return new VirtualPaths(null, null);
+        }
+    }
+
+    /**
      * Return the on-disk path to the APK that backs a virtual package, or
      * null if the engine can't find it. AbiRouter needs this to decide
      * whether a launch must be dispatched to the 32-bit helper.

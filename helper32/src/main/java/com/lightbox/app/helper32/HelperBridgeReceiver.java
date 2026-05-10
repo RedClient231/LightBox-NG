@@ -7,6 +7,7 @@ import android.util.Log;
 
 import com.lightbox.app.abi.HelperPackage;
 import com.lightbox.app.engine.RealVirtualEngineBridge;
+import com.lightbox.app.engine.XapkInstaller;
 
 /**
  * Handles install / uninstall requests dispatched to the helper by the
@@ -39,7 +40,23 @@ public class HelperBridgeReceiver extends BroadcastReceiver {
                 Log.i(TAG, "helper installing " + apkPath);
                 boolean ok = bridge.installApk(apkPath);
                 Log.i(TAG, "helper install result: " + ok);
-                // Publish change so main can re-query the installed-games provider.
+                context.getContentResolver().notifyChange(HelperPackage.INSTALLED_URI, null);
+                break;
+            }
+            case HelperPackage.ACTION_INSTALL_BUNDLE: {
+                if (apkPath == null) {
+                    Log.w(TAG, "install-bundle request with no apk_path");
+                    return;
+                }
+                Log.i(TAG, "helper installing bundle " + apkPath);
+                // Run the same XapkInstaller the main app uses. The helper's
+                // context IS a 32-bit process, so everything it extracts and
+                // installs lands in a sandbox a 32-bit :pN can dlopen.
+                XapkInstaller installer = new XapkInstaller(context, bridge);
+                XapkInstaller.Result res = installer.install(apkPath);
+                Log.i(TAG, "helper bundle install result: success=" + res.success
+                        + " pkg=" + res.packageName
+                        + (res.errorMessage != null ? " err=" + res.errorMessage : ""));
                 context.getContentResolver().notifyChange(HelperPackage.INSTALLED_URI, null);
                 break;
             }

@@ -55,16 +55,30 @@ public final class AbiRouter {
         this.inProcess = inProcess;
     }
 
-    /** Pure routing decision given an APK file. Does not launch anything. */
-    public Decision decide(String apkPath) {
-        VirtualAbiResolver.AbiInfo info = VirtualAbiResolver.resolve(apkPath);
+    /**
+     * Pure routing decision given an APK file and (optionally) its extracted
+     * native-lib dir. The lib dir is the authoritative source for Unity-style
+     * games whose APK itself is lib-free — the real .so files live in a
+     * config split, and after install Bcore extracts them into
+     * {@code /data/.../blackbox/data/app/<pkg>/lib/*.so}.
+     */
+    public Decision decide(String apkPath, String nativeLibDir) {
+        VirtualAbiResolver.AbiInfo info = (apkPath == null && nativeLibDir == null)
+                ? new VirtualAbiResolver.AbiInfo(new String[0], false, false, "nothing-to-check")
+                : VirtualAbiResolver.resolveInstalled(apkPath, nativeLibDir);
         if (info.is32BitOnly()) {
-            return new Decision(Route.DISPATCH_TO_HELPER32, info, "apk is armeabi-v7a only");
+            return new Decision(Route.DISPATCH_TO_HELPER32, info,
+                    "installed lib dir is armeabi-v7a only");
         }
         return new Decision(Route.IN_PROCESS_MAIN, info,
-                info.has64Bit ? "apk has arm64 libs" :
-                info.hasNoNative() ? "apk has no native libs (pure java)" :
+                info.has64Bit ? "installed libs include arm64" :
+                info.hasNoNative() ? "no native libs observed" :
                 "fallback to main");
+    }
+
+    /** Pure routing decision given an APK file. Does not launch anything. */
+    public Decision decide(String apkPath) {
+        return decide(apkPath, null);
     }
 
     // ---------------------------------------------------------------------
@@ -98,29 +112,55 @@ public final class AbiRouter {
         }
     }
 
+    /**
+     * Ask the helper to install an XAPK/APKS/APKM bundle. Same rules as
+     * {@link #dispatchInstallToHelper(String, int)} but the helper runs its
+     * own XapkInstaller on its side.
+     */
+    public boolean dispatchBundleInstallToHelper(String bundlePath, int userId) {
+        if (!HelperPackage.isInstalled(ctx)) {
+            Log.w(TAG, "helper not installed, cannot dispatch bundle install");
+            return false;
+        }
+        Intent i = new Intent(HelperPackage.ACTION_INSTALL_BUNDLE);
+        i.setPackage(HelperPackage.PACKAGE);
+        i.putExtra(HelperPackage.EXTRA_APK_PATH, bundlePath);
+        i.putExtra(HelperPackage.EXTRA_USER_ID, userId);
+        try {
+            ctx.sendBroadcast(i, HelperPackage.PERMISSION_BRIDGE);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "dispatch bundle install failed: " + e.getMessage(), e);
+            return false;
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Launch
-    // ---------------------------------------------------------------------
 
     /**
-     * Launch a virtual app. If it's 32-bit and the helper is installed,
-     * the Intent is delivered to the helper's LaunchActivity. Otherwise
-     * launched in-process by the main engine.
-     *
-     * Returns true if dispatch happened (not necessarily that the game is
-     * running yet — just that we handed off successfully).
+     * Launch a virtual app. Uses both the APK path and the extracted
+     * nativeLibraryDir (when available) to make the correct ABI call for
+     * Unity-style games whose base APK is lib-free.
      */
-    public boolean launch(String virtualPackageName, String apkPathHintOrNull, int userId) {
-        Decision d = (apkPathHintOrNull != null)
-                ? decide(apkPathHintOrNull)
-                : new Decision(Route.IN_PROCESS_MAIN, null, "no apk hint, fallback");
-
-        Log.i(TAG, "launch " + virtualPackageName + " -> " + d.route + " (" + d.reason + ")");
+    public boolean launch(String virtualPackageName, String apkPathHintOrNull,
+                          String nativeLibDirOrNull, int userId) {
+        Decision d = decide(apkPathHintOrNull, nativeLibDirOrNull);
+        Log.i(TAG, "launch " + virtualPackageName + " -> " + d.route
+                + " (" + d.reason + "; " + d.abi + ")");
 
         if (d.route == Route.DISPATCH_TO_HELPER32 && HelperPackage.isInstalled(ctx)) {
             return launchViaHelper(virtualPackageName, userId);
         }
         return inProcess.launchApp(virtualPackageName);
+    }
+
+    /**
+     * Back-compat overload. Prefer the 4-arg form in new code because the
+     * nativeLibraryDir is what makes routing correct for split-APK games.
+     */
+    public boolean launch(String virtualPackageName, String apkPathHintOrNull, int userId) {
+        return launch(virtualPackageName, apkPathHintOrNull, null, userId);
     }
 
     private boolean launchViaHelper(String virtualPackageName, int userId) {

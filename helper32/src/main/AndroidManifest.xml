@@ -57,6 +57,7 @@
             android:permission="com.lightbox.ng.permission.HELPER_BRIDGE">
             <intent-filter>
                 <action android:name="com.lightbox.ng.arm32.action.INSTALL" />
+                <action android:name="com.lightbox.ng.arm32.action.INSTALL_BUNDLE" />
                 <action android:name="com.lightbox.ng.arm32.action.UNINSTALL" />
             </intent-filter>
         </receiver>

@@ -28,6 +28,14 @@ public final class HelperPackage {
     /** Intent action for "install this APK inside the helper's sandbox". */
     public static final String ACTION_INSTALL = "com.lightbox.ng.arm32.action.INSTALL";
 
+    /**
+     * Intent action for "install this XAPK/APKS/APKM bundle inside the
+     * helper's sandbox". Carries {@link #EXTRA_APK_PATH} pointing to the
+     * bundle file (world-readable, on shared storage).
+     */
+    public static final String ACTION_INSTALL_BUNDLE =
+            "com.lightbox.ng.arm32.action.INSTALL_BUNDLE";
+
     /** Intent action for "uninstall this virtual package from the helper's sandbox". */
     public static final String ACTION_UNINSTALL = "com.lightbox.ng.arm32.action.UNINSTALL";
 

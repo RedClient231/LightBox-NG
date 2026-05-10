@@ -190,6 +190,42 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 }
 
                 if (looksLikeBundle) {
+                    // ABI-aware bundle routing: peek the bundle's split APKs.
+                    // Unity games (e.g., Traffic Rider) keep .so files in a
+                    // config.armeabi_v7a.apk split — the base APK looks
+                    // "pure Java" to a single-APK scan. peekBundle() scans
+                    // the splits too.
+                    VirtualAbiResolver.AbiInfo bundleAbi =
+                            VirtualAbiResolver.peekBundle(stagedPath);
+                    Log.i(TAG, "bundle abi: " + bundleAbi);
+                    if (bundleAbi.is32BitOnly()) {
+                        if (!HelperPackage.isInstalled(this)) {
+                            runOnUiThread(() -> promptInstallHelper(
+                                    displayName != null ? displayName : "this 32-bit game"));
+                            return;
+                        }
+                        // Stage for helper read (external cache = world-readable).
+                        String sharedStaging = stageBundleForHelper(stagedPath,
+                                displayName != null ? displayName : "bundle.xapk");
+                        if (sharedStaging == null) {
+                            runOnUiThread(() -> Toast.makeText(this,
+                                    getString(R.string.error_install_failed),
+                                    Toast.LENGTH_SHORT).show());
+                            return;
+                        }
+                        boolean dispatched = abiRouter.dispatchBundleInstallToHelper(
+                                sharedStaging, 0);
+                        runOnUiThread(() -> Toast.makeText(this,
+                                dispatched
+                                        ? "Installing into 32-bit helper..."
+                                        : getString(R.string.error_install_failed),
+                                Toast.LENGTH_SHORT).show());
+                        // Don't delete the staged bundle — helper reads it
+                        // asynchronously. Helper cleans up after install.
+                        new File(stagedPath).delete();
+                        return;
+                    }
+
                     XapkInstaller.Result result = xapkInstaller.install(stagedPath);
                     runOnUiThread(() -> {
                         if (result.success) {
@@ -313,6 +349,38 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
             return dest.getAbsolutePath();
         } catch (Exception e) {
             Log.e(TAG, "stageForHelper failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Stage an XAPK/APKS/APKM bundle for the helper. Same mechanics as
+     * {@link #stageForHelper(String, String)} but preserves the source
+     * filename so helper's XapkInstaller sees a familiar extension.
+     */
+    private String stageBundleForHelper(String bundlePath, String displayName) {
+        try {
+            File extCache = getExternalCacheDir();
+            if (extCache == null) return null;
+            File shared = new File(extCache, "helper_stage");
+            if (!shared.exists() && !shared.mkdirs()) return null;
+            // Ensure extension survives into the helper so isBundleFile() works.
+            String name = displayName != null ? sanitizeFilename(displayName) : "bundle.xapk";
+            if (!name.toLowerCase(Locale.ROOT).matches(".*\\.(xapk|apks|apkm)$")) {
+                name = name + ".xapk";
+            }
+            File dest = new File(shared, System.currentTimeMillis() + "_" + name);
+            try (InputStream in = new java.io.FileInputStream(bundlePath);
+                 FileOutputStream out = new FileOutputStream(dest)) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            //noinspection ResultOfMethodCallIgnored
+            dest.setReadable(true, false);
+            return dest.getAbsolutePath();
+        } catch (Exception e) {
+            Log.e(TAG, "stageBundleForHelper failed", e);
             return null;
         }
     }
@@ -458,12 +526,17 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
 
     private void launchClonedApp(ClonedApp app) {
         try {
-            // Resolve the APK path so AbiRouter can inspect its native libs.
-            // If we can't find it (shouldn't happen for properly installed
-            // virtual apps), fall through to in-process launch which handles
-            // pure-Java and 64-bit cases correctly.
-            String apkPath = engineBridge.getVirtualApkPath(app.getPackageName());
-            boolean launched = abiRouter.launch(app.getPackageName(), apkPath, 0);
+            // Use the extracted native-lib dir, not just the APK path —
+            // for Unity games the APK has no libs and naive scanning says
+            // "pure Java", which would wrongly route a 32-bit game into
+            // the 64-bit main and repeat the Traffic Rider crash.
+            RealVirtualEngineBridge.VirtualPaths paths =
+                    engineBridge.getVirtualPaths(app.getPackageName());
+            boolean launched = abiRouter.launch(
+                    app.getPackageName(),
+                    paths != null ? paths.apkPath : null,
+                    paths != null ? paths.nativeLibDir : null,
+                    0);
             if (!launched) {
                 Toast.makeText(this, getString(R.string.error_launch_failed),
                         Toast.LENGTH_SHORT).show();
