@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Visible only in Settings > Apps. No launcher icon. Keep short
+         so the user knows why this package is here if they ever look. -->
+    <string name="helper_app_name">LightBox-NG v7 helper</string>
+</resources>

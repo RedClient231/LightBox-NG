@@ -88,6 +88,27 @@ public class RealVirtualEngineBridge {
         }
     }
 
+    /**
+     * Return the on-disk path to the APK that backs a virtual package, or
+     * null if the engine can't find it. AbiRouter needs this to decide
+     * whether a launch must be dispatched to the 32-bit helper.
+     */
+    public String getVirtualApkPath(String packageName) {
+        try {
+            int userId = getOrCreateDefaultUser();
+            // BPackageManager owns the virtual PMS data.
+            android.content.pm.ApplicationInfo info =
+                    BlackBoxCore.getBPackageManager()
+                            .getApplicationInfo(packageName, 0, userId);
+            if (info != null && info.sourceDir != null && !info.sourceDir.isEmpty()) {
+                return info.sourceDir;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getVirtualApkPath failed for " + packageName + ": " + e.getMessage());
+        }
+        return null;
+    }
+
     public void uninstallApp(String packageName) {
         try {
             int userId = getOrCreateDefaultUser();

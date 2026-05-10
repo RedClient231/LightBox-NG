@@ -1,0 +1,118 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.jetbrains.kotlin.android)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// :helper32 — the armeabi-v7a sibling APK.
+//
+// Purpose: on a 64-bit Android device, the main app's processes are all
+// forked from zygote64 and cannot dlopen a 32-bit libgame.so. To run 32-bit
+// virtual games, we install a SECOND package on the device whose
+// primaryCpuAbi is armeabi-v7a. Android spawns its processes from
+// zygote (32-bit). It carries a full copy of Bcore + the main app's
+// source code, so it is a fully functional LightBox host — just 32-bit.
+//
+// The main app dispatches 32-bit launches to this package via an explicit
+// Intent; it is NOT an IPC shell (that was the v1.0.15 mistake).
+// ─────────────────────────────────────────────────────────────────────────
+android {
+    namespace 'com.lightbox.app.helper32'
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion = "27.2.12479018"
+
+    defaultConfig {
+        applicationId "com.lightbox.ng.arm32"
+        minSdk rootProject.ext.minSdk
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode rootProject.ext.versionCode
+        versionName rootProject.ext.versionName
+
+        // ABI lock — the entire point of this module
+        ndk {
+            abiFilters "armeabi-v7a"
+        }
+    }
+
+    // Share the signing config with :app via the root project so the
+    // signature-level permission the two APKs exchange actually matches.
+    signingConfigs {
+        lightboxNgDebug {
+            storeFile rootProject.file('signing/lightbox-ng-debug.keystore')
+            storePassword 'lightboxng'
+            keyAlias 'lightbox-ng'
+            keyPassword 'lightboxng'
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.lightboxNgDebug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.lightboxNgDebug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // Reuse engine/model/abi from main; helper is headless. We DELIBERATELY
+    // keep main's res tree in the source set so helper can reference the
+    // shared Theme.LightBox (declared in main/res/values/styles.xml) and
+    // launcher icons without duplication. The unused main-only layouts
+    // (activity_main, menu/main_menu, etc.) still reference MainActivity
+    // which we excluded — AGP strips them during compilation because
+    // nothing in helper's Java code reads those layout IDs.
+    //
+    // If this causes resource-compilation errors on a newer AGP, switch
+    // to a fully independent helper res tree.
+    sourceSets {
+        main {
+            java {
+                srcDir '../app/src/main/java'
+                exclude 'com/lightbox/app/MainActivity.java'
+                exclude 'com/lightbox/app/ui/**'
+                srcDir 'src/main/java'
+            }
+            res.srcDirs = [
+                    '../app/src/main/res',
+                    'src/main/res'
+            ]
+            manifest.srcFile 'src/main/AndroidManifest.xml'
+            assets.srcDirs = ['../app/src/main/assets', 'src/main/assets']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    buildFeatures { viewBinding true }
+
+    applicationVariants.configureEach { variant ->
+        variant.outputs.configureEach { output ->
+            output.outputFileName =
+                    "LightBox-NG-helper32-${variant.versionName}-${variant.buildType.name}.apk"
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+    implementation project(':Bcore')
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.constraintlayout
+    implementation libs.core.ktx
+
+    implementation 'androidx.recyclerview:recyclerview:1.2.1'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.3.1'
+    implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.3.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.3.1'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+}

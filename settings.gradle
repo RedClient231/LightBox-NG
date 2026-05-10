@@ -23,6 +23,7 @@ dependencyResolutionManagement {
 rootProject.name = "LightBox"
 
 include ':app'
+include ':helper32'
 include ':black-reflection'
 include ':compiler'
 include ':Bcore'

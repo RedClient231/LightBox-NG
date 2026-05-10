@@ -17,18 +17,15 @@ android {
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
-        // ── Dual-ABI: one APK ships BOTH arm64-v8a and armeabi-v7a .so sets ──
+        // Main app is arm64-v8a ONLY. 32-bit virtual games go through the
+        // :helper32 sibling APK instead (see app/abi/AbiRouter).
         //
-        // Why not split: the whole point of LightBox-NG is that ONE install
-        // handles both 32-bit and 64-bit virtual games, routed per-process by
-        // the Bcore proxy pool. The pool's :pN processes are forked by Android
-        // from whichever zygote matches the proxy's target ABI; shipping both
-        // .so sets is what enables that choice at fork time.
-        //
-        // No splits.abi{} block — we deliberately DO NOT want per-ABI split
-        // APKs. That would defeat the purpose.
+        // Why arm64-only: if main shipped armeabi-v7a libs too, Android
+        // might mark the app primaryCpuAbi=armeabi-v7a on some devices and
+        // spawn the proxy pool as 32-bit, breaking 64-bit games with
+        // exactly the inverse of the error we hit in M1.
         ndk {
-            abiFilters "armeabi-v7a", "arm64-v8a"
+            abiFilters "arm64-v8a"
         }
     }
 

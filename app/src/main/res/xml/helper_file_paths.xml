@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Used by HelperInstaller to expose the bundled helper32.apk to the
+         package installer. Only the single file under cache/helper/ is
+         shared; nothing else leaks through this provider. -->
+    <cache-path name="helper" path="helper/" />
+</paths>
