@@ -38,6 +38,7 @@ import com.lightbox.app.engine.PackageInstallManager;
 import com.lightbox.app.engine.PackageMetadataReader;
 import com.lightbox.app.engine.RealVirtualEngineBridge;
 import com.lightbox.app.engine.XapkInstaller;
+import com.lightbox.app.gms.MicroGSupport;
 import com.lightbox.app.model.ClonedApp;
 import com.lightbox.app.ui.AppListAdapter;
 import com.lightbox.app.ui.ImportDialogFragment;
@@ -395,6 +396,22 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 return;
             }
 
+            // v1.0.4 (M1): guided microG GmsCore import. When the APK's
+            // packageName matches a known microG distribution, show a dialog
+            // explaining what microG enables, then dual-install into both
+            // sandboxes. No Bcore changes in M1 — microG will install but
+            // most games will not yet route through it. M2 (v1.0.5) adds
+            // signature spoofing in IPackageManagerProxy to route GMS calls
+            // to microG. Detection runs BEFORE the GameGuardian check
+            // because the whitelists don't overlap — order is for clarity,
+            // not correctness.
+            if (MicroGSupport.isMicroGPackage(info.packageName)) {
+                final String apkPathFinal = apkPath;
+                final PackageMetadataReader.ApkInfo infoFinal = info;
+                runOnUiThread(() -> showGuidedMicroGDialogAndInstall(apkPathFinal, infoFinal));
+                return;
+            }
+
             // v1.0.2: guided GameGuardian import. When the APK's packageName
             // matches a known GG distribution, show ONE up-front dialog that
             // tells the user which GG installer mode to pick on each side and
@@ -575,6 +592,96 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 }
                 pendingGGInstall = new PendingGGInstall(
                         staged, info.packageName, info.appName);
+                runOnUiThread(() -> promptInstallHelper(
+                        info.appName + " (32-bit space)"));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Guided microG GmsCore import (v1.0.4 / M1)
+    //
+    // Mirrors the GameGuardian guided-install pattern above but with
+    // microG-specific copy. M1 scope is strictly install-side: show dialog,
+    // dual-install into both sandboxes, report result. No Bcore changes.
+    // Signature spoofing for com.google.android.gms / com.android.vending /
+    // com.google.android.gsf ships in M2 (v1.0.5) after on-device validation
+    // that microG actually starts inside Bcore.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Main-thread entry. Inspects current sandbox state, picks the right
+     * dialog variant from {@link MicroGSupport.State}, and dispatches on
+     * confirm. Cancel/dismiss does NOT fall through to the plain dual-ABI
+     * install — unlike GameGuardian, installing microG silently when the
+     * user cancels is not useful (they explicitly opted out). Behaviour
+     * for non-microG APKs is unchanged.
+     */
+    private void showGuidedMicroGDialogAndInstall(final String apkPath,
+                                                  final PackageMetadataReader.ApkInfo info) {
+        boolean presentInMain = isPackagePresentInMain(info.packageName);
+        boolean presentInHelper = isPackagePresentInHelper(info.packageName);
+        final MicroGSupport.State state =
+                MicroGSupport.classify(presentInMain, presentInHelper);
+
+        new com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                .setTitle(MicroGSupport.DIALOG_TITLE)
+                .setMessage(MicroGSupport.messageFor(state))
+                .setCancelable(true)
+                .setPositiveButton(MicroGSupport.positiveButtonFor(state),
+                        (d, w) -> new Thread(() ->
+                                runGuidedMicroGInstall(apkPath, info, state)).start())
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+    }
+
+    /**
+     * Executes the side(s) the user confirmed. Runs on a background thread
+     * because the underlying install / dispatch helpers do disk I/O.
+     *
+     * <p>Policy per state (identical shape to runGuidedGGInstall):
+     * <ul>
+     *   <li>{@code FRESH} / {@code REINSTALL_BOTH}: install into main, then
+     *       either dispatch to helper now, or — if the helper isn't
+     *       installed — prompt for helper install and tell the user to
+     *       re-import microG after. Unlike GG, we do NOT stage a pending
+     *       install: microG is a one-time setup, and re-importing the APK
+     *       the user already has on hand is trivial.</li>
+     *   <li>{@code ADD_TO_HELPER}: helper side only.</li>
+     *   <li>{@code ADD_TO_MAIN}: main side only.</li>
+     * </ul>
+     */
+    private void runGuidedMicroGInstall(String apkPath,
+                                        PackageMetadataReader.ApkInfo info,
+                                        MicroGSupport.State state) {
+        final boolean doMain = state == MicroGSupport.State.FRESH
+                || state == MicroGSupport.State.REINSTALL_BOTH
+                || state == MicroGSupport.State.ADD_TO_MAIN;
+        final boolean doHelper = state == MicroGSupport.State.FRESH
+                || state == MicroGSupport.State.REINSTALL_BOTH
+                || state == MicroGSupport.State.ADD_TO_HELPER;
+
+        if (doMain) {
+            boolean success = installManager.installApk(apkPath);
+            runOnUiThread(() -> {
+                Toast.makeText(this, success
+                                ? getString(R.string.app_installed,
+                                        info.appName + " (64-bit space)")
+                                : getString(R.string.error_install_failed),
+                        Toast.LENGTH_SHORT).show();
+                loadClonedApps();
+            });
+        }
+
+        if (doHelper) {
+            if (HelperPackage.isInstalled(this)) {
+                dispatchSingleApkToHelper(apkPath, info.packageName, info.appName);
+            } else {
+                // No pending-install machinery for microG. Tell the user to
+                // install the helper APK, then re-import microG. microG's
+                // install isn't ABI-blocking (it's a universal APK), so
+                // main-side will have landed already; helper-side is a
+                // clean retry.
                 runOnUiThread(() -> promptInstallHelper(
                         info.appName + " (32-bit space)"));
             }
