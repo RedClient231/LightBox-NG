@@ -45,6 +45,24 @@ public final class HelperPackage {
     /** Extra: staged APK path on disk (string). */
     public static final String EXTRA_APK_PATH = "apk_path";
 
+    /**
+     * Extra: {@code content://} URI for the staged APK or bundle, readable
+     * by the helper via {@code ContentResolver.openInputStream}.
+     *
+     * Android 11+ scoped storage blocks the helper (different UID) from
+     * opening files under {@code /storage/emulated/0/Android/data/<main>/},
+     * even with {@code MANAGE_EXTERNAL_STORAGE}. A FileProvider URI with
+     * {@code FLAG_GRANT_READ_URI_PERMISSION} is the canonical cross-package
+     * read path. Value is a stringified URI (see {@link android.net.Uri#toString()}).
+     */
+    public static final String EXTRA_APK_URI = "apk_uri";
+
+    /**
+     * Extra: hint for a human-readable filename the helper can use when
+     * copying from the URI to its own cache. Optional.
+     */
+    public static final String EXTRA_DISPLAY_NAME = "display_name";
+
     /** Extra: virtual user id (int, default 0). */
     public static final String EXTRA_USER_ID = "user_id";
 

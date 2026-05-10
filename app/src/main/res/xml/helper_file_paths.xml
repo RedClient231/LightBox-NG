@@ -4,4 +4,11 @@
          package installer. Only the single file under cache/helper/ is
          shared; nothing else leaks through this provider. -->
     <cache-path name="helper" path="helper/" />
+
+    <!-- Used by AbiRouter.dispatchBundleInstallToHelper to hand XAPK /
+         APK files to the 32-bit helper across the scoped-storage boundary.
+         On Android 11+ a sibling package cannot directly read another
+         app's external cache; FileProvider + FLAG_GRANT_READ_URI_PERMISSION
+         is the only reliable mechanism. -->
+    <external-cache-path name="helper_stage" path="helper_stage/" />
 </paths>

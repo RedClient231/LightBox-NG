@@ -204,7 +204,9 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                                     displayName != null ? displayName : "this 32-bit game"));
                             return;
                         }
-                        // Stage for helper read (external cache = world-readable).
+                        // Stage into our own external cache (private to main on
+                        // Android 11+). We hand the helper a FileProvider URI
+                        // — its UID cannot read our private dir directly.
                         String sharedStaging = stageBundleForHelper(stagedPath,
                                 displayName != null ? displayName : "bundle.xapk");
                         if (sharedStaging == null) {
@@ -213,8 +215,25 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                                     Toast.LENGTH_SHORT).show());
                             return;
                         }
+                        android.net.Uri bundleUri = null;
+                        try {
+                            bundleUri = androidx.core.content.FileProvider.getUriForFile(
+                                    this,
+                                    getPackageName() + ".helper_fileprovider",
+                                    new File(sharedStaging));
+                            // Broadcasts don't auto-carry URI perms; grant
+                            // explicitly to the helper package.
+                            grantUriPermission(HelperPackage.PACKAGE, bundleUri,
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        } catch (Exception e) {
+                            Log.e(TAG, "FileProvider URI build failed", e);
+                        }
+                        final android.net.Uri finalUri = bundleUri;
+                        final String finalStaging = sharedStaging;
                         boolean dispatched = abiRouter.dispatchBundleInstallToHelper(
-                                sharedStaging, 0);
+                                finalStaging, finalUri,
+                                displayName != null ? displayName : "bundle.xapk",
+                                0);
                         runOnUiThread(() -> Toast.makeText(this,
                                 dispatched
                                         ? "Installing into 32-bit helper..."
@@ -287,7 +306,21 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                             Toast.LENGTH_SHORT).show());
                     return;
                 }
-                boolean dispatched = abiRouter.dispatchInstallToHelper(sharedStaging, 0);
+                // Expose via FileProvider so the helper's UID can read it on
+                // Android 11+. See ACTION_INSTALL_BUNDLE flow for rationale.
+                android.net.Uri apkUri = null;
+                try {
+                    apkUri = androidx.core.content.FileProvider.getUriForFile(
+                            this,
+                            getPackageName() + ".helper_fileprovider",
+                            new File(sharedStaging));
+                    grantUriPermission(HelperPackage.PACKAGE, apkUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception e) {
+                    Log.e(TAG, "FileProvider URI build failed for single APK", e);
+                }
+                boolean dispatched = abiRouter.dispatchInstallToHelper(
+                        sharedStaging, apkUri, info.packageName + ".apk", 0);
                 runOnUiThread(() -> {
                     if (dispatched) {
                         Toast.makeText(this,

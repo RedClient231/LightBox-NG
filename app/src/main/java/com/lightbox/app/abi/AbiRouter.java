@@ -90,18 +90,20 @@ public final class AbiRouter {
      * helper isn't installed (caller should prompt the user to install it).
      *
      * The helper consumes {@link HelperPackage#ACTION_INSTALL} in a
-     * receiver it declares. Staged apkPath must be world-readable or on
-     * shared storage; the helper cannot read files inside main's
-     * {@code /data/data/com.lightbox.ng/files/...} directly.
+     * receiver it declares. The caller MUST have granted the helper read
+     * permission for {@code apkUri} via {@code grantUriPermission()}.
      */
-    public boolean dispatchInstallToHelper(String apkPath, int userId) {
+    public boolean dispatchInstallToHelper(String apkPath, android.net.Uri apkUri,
+                                           String displayName, int userId) {
         if (!HelperPackage.isInstalled(ctx)) {
             Log.w(TAG, "helper not installed, cannot dispatch install");
             return false;
         }
         Intent i = new Intent(HelperPackage.ACTION_INSTALL);
         i.setPackage(HelperPackage.PACKAGE);
-        i.putExtra(HelperPackage.EXTRA_APK_PATH, apkPath);
+        if (apkPath != null) i.putExtra(HelperPackage.EXTRA_APK_PATH, apkPath);
+        if (apkUri != null)  i.putExtra(HelperPackage.EXTRA_APK_URI, apkUri.toString());
+        if (displayName != null) i.putExtra(HelperPackage.EXTRA_DISPLAY_NAME, displayName);
         i.putExtra(HelperPackage.EXTRA_USER_ID, userId);
         try {
             ctx.sendBroadcast(i, HelperPackage.PERMISSION_BRIDGE);
@@ -112,20 +114,39 @@ public final class AbiRouter {
         }
     }
 
+    /** Back-compat (path-only). Kept for callers that still stage world-readable. */
+    public boolean dispatchInstallToHelper(String apkPath, int userId) {
+        return dispatchInstallToHelper(apkPath, null, null, userId);
+    }
+
     /**
      * Ask the helper to install an XAPK/APKS/APKM bundle. Same rules as
      * {@link #dispatchInstallToHelper(String, int)} but the helper runs its
      * own XapkInstaller on its side.
+     *
+     * On Android 11+ the helper cannot read files inside main's external
+     * cache directly (scoped storage). The caller MUST provide a content
+     * URI backed by a FileProvider and the caller MUST have granted the
+     * helper read permission via {@code grantUriPermission}. The path is
+     * still passed for logging / filename hinting only.
      */
-    public boolean dispatchBundleInstallToHelper(String bundlePath, int userId) {
+    public boolean dispatchBundleInstallToHelper(String bundlePath,
+                                                 android.net.Uri bundleUri,
+                                                 String displayName,
+                                                 int userId) {
         if (!HelperPackage.isInstalled(ctx)) {
             Log.w(TAG, "helper not installed, cannot dispatch bundle install");
             return false;
         }
         Intent i = new Intent(HelperPackage.ACTION_INSTALL_BUNDLE);
         i.setPackage(HelperPackage.PACKAGE);
-        i.putExtra(HelperPackage.EXTRA_APK_PATH, bundlePath);
+        if (bundlePath != null) i.putExtra(HelperPackage.EXTRA_APK_PATH, bundlePath);
+        if (bundleUri != null)  i.putExtra(HelperPackage.EXTRA_APK_URI, bundleUri.toString());
+        if (displayName != null) i.putExtra(HelperPackage.EXTRA_DISPLAY_NAME, displayName);
         i.putExtra(HelperPackage.EXTRA_USER_ID, userId);
+        // FLAG_GRANT_READ_URI_PERMISSION alone does not apply to broadcasts.
+        // Broadcasts require grantUriPermission() to have been called by the
+        // sender for the URI/receiving package combination — see caller.
         try {
             ctx.sendBroadcast(i, HelperPackage.PERMISSION_BRIDGE);
             return true;
@@ -133,6 +154,11 @@ public final class AbiRouter {
             Log.e(TAG, "dispatch bundle install failed: " + e.getMessage(), e);
             return false;
         }
+    }
+
+    /** Back-compat overload (path-only). */
+    public boolean dispatchBundleInstallToHelper(String bundlePath, int userId) {
+        return dispatchBundleInstallToHelper(bundlePath, null, null, userId);
     }
 
     // ---------------------------------------------------------------------
