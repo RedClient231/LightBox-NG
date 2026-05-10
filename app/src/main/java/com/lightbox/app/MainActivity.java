@@ -30,6 +30,7 @@ import androidx.recyclerview.widget.RecyclerView;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
 
 import com.lightbox.app.abi.AbiRouter;
+import com.lightbox.app.abi.GameGuardianHint;
 import com.lightbox.app.abi.HelperInstaller;
 import com.lightbox.app.abi.HelperPackage;
 import com.lightbox.app.abi.VirtualAbiResolver;
@@ -63,6 +64,25 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
     private AbiRouter abiRouter;
     private PackageInstallManager installManager;
     private XapkInstaller xapkInstaller;
+
+    // Guided-GG import (v1.0.2): when we detect a GameGuardian APK but the
+    // helper isn't installed yet, we install the main-side copy immediately,
+    // stash the pending helper-side dispatch here, prompt the user to install
+    // the helper APK, and finish the helper-side install in onResume() once
+    // HelperPackage.isInstalled() flips true. Held on the Activity instance
+    // only — survives a process foreground trip but NOT a process death.
+    // Acceptable because re-importing the GG APK is cheap and idempotent.
+    private static final class PendingGGInstall {
+        final String stagedApkPath;
+        final String packageName;
+        final String displayName;
+        PendingGGInstall(String stagedApkPath, String packageName, String displayName) {
+            this.stagedApkPath = stagedApkPath;
+            this.packageName = packageName;
+            this.displayName = displayName;
+        }
+    }
+    private volatile PendingGGInstall pendingGGInstall;
 
     // OpenDocument (not GetContent) because the latter hides XAPK files when
     // the caller specifies a strict MIME type — many file managers label
@@ -100,7 +120,42 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
     @Override
     protected void onResume() {
         super.onResume();
+        resumePendingGGInstallIfAny();
         loadClonedApps();
+    }
+
+    /**
+     * Finishes the helper-side leg of a guided GameGuardian install that was
+     * kicked off before the helper package existed. Safe to call every resume:
+     * no-op when {@link #pendingGGInstall} is null or when the helper still
+     * isn't installed. We intentionally never retry automatically past one
+     * attempt per pending record — if the dispatch fails, we show a toast and
+     * clear the record so the user can re-import rather than entering a
+     * dispatch loop against a broken helper.
+     */
+    private void resumePendingGGInstallIfAny() {
+        final PendingGGInstall pending = pendingGGInstall;
+        if (pending == null) return;
+        if (!HelperPackage.isInstalled(this)) return; // user cancelled / not done yet
+
+        pendingGGInstall = null; // claim it before doing any work
+
+        File staged = new File(pending.stagedApkPath);
+        if (!staged.exists()) {
+            // External cache can be wiped by the OS while we were backgrounded.
+            Log.w(TAG, "resumePendingGGInstallIfAny: staged APK gone: "
+                    + pending.stagedApkPath);
+            Toast.makeText(this,
+                    "Re-import GameGuardian to finish installing the 32-bit copy.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        new Thread(() -> {
+            boolean ok = dispatchSingleApkToHelper(
+                    pending.stagedApkPath, pending.packageName, pending.displayName);
+            Log.i(TAG, "resumePendingGGInstallIfAny: helper dispatch -> " + ok);
+        }).start();
     }
 
     private void showImportDialog() {
@@ -223,6 +278,40 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
                 return;
             }
 
+            // v1.0.2: guided GameGuardian import. When the APK's packageName
+            // matches a known GG distribution, show ONE up-front dialog that
+            // tells the user which GG installer mode to pick on each side and
+            // — if the helper isn't yet installed — stages the helper-side
+            // dispatch for onResume() to finish. The standard dual-install
+            // below is the fallback: if the user dismisses the dialog or the
+            // dialog path fails, we fall straight through to it so behavior
+            // never regresses past v1.0.1.
+            if (GameGuardianHint.isGameGuardianPackage(info.packageName)) {
+                final String apkPathFinal = apkPath;
+                final PackageMetadataReader.ApkInfo infoFinal = info;
+                runOnUiThread(() -> showGuidedGGDialogAndInstall(apkPathFinal, infoFinal));
+                return;
+            }
+
+            installApkWithDualAbiPolicy(apkPath, info);
+        } catch (Exception e) {
+            Log.e(TAG, "APK install failed", e);
+            runOnUiThread(() -> Toast.makeText(this,
+                    getString(R.string.error_install_failed_detail, e.getMessage()),
+                    Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    /**
+     * The v1.0.1 dual-ABI install policy, lifted verbatim so the guided-GG
+     * path ({@link #showGuidedGGDialogAndInstall}) can call into it and the
+     * non-GG fallback path can call into it too. Keeping this as one method
+     * keeps one source of truth for the ABI routing — the behaviour must
+     * stay byte-identical to v1.0.1 for every non-GG APK.
+     */
+    private void installApkWithDualAbiPolicy(String apkPath,
+                                             PackageMetadataReader.ApkInfo info) {
+        try {
             // ABI-aware install routing: if the APK is 32-bit-only, the install
             // MUST land inside the helper's sandbox so its .so files end up in a
             // location a 32-bit process can dlopen. Installing a 32-bit game into
@@ -283,6 +372,129 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Guided GameGuardian import (v1.0.2)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Main-thread entry point. Inspects current sandbox state, picks the
+     * right dialog variant from {@link GameGuardianHint.State}, and wires the
+     * positive button to the appropriate install side(s). Cancel / dismiss
+     * explicitly falls back to {@link #installApkWithDualAbiPolicy} so a user
+     * who dismisses still gets the v1.0.1 behaviour — never a regression.
+     */
+    private void showGuidedGGDialogAndInstall(final String apkPath,
+                                              final PackageMetadataReader.ApkInfo info) {
+        boolean presentInMain = isPackagePresentInMain(info.packageName);
+        boolean presentInHelper = isPackagePresentInHelper(info.packageName);
+        final GameGuardianHint.State state =
+                GameGuardianHint.classify(presentInMain, presentInHelper);
+
+        new com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                .setTitle(GameGuardianHint.DIALOG_TITLE)
+                .setMessage(GameGuardianHint.messageFor(state))
+                .setCancelable(true)
+                .setPositiveButton(GameGuardianHint.positiveButtonFor(state),
+                        (d, w) -> new Thread(() ->
+                                runGuidedGGInstall(apkPath, info, state)).start())
+                .setNegativeButton(R.string.cancel,
+                        (d, w) -> new Thread(() ->
+                                installApkWithDualAbiPolicy(apkPath, info)).start())
+                .setOnCancelListener(d -> new Thread(() ->
+                        installApkWithDualAbiPolicy(apkPath, info)).start())
+                .show();
+    }
+
+    /**
+     * Executes the side(s) the user confirmed. Runs on a background thread
+     * because the underlying install / dispatch helpers do disk I/O.
+     *
+     * <p>Policy per state:
+     * <ul>
+     *   <li>{@code FRESH} / {@code REINSTALL_BOTH}: install into main, then
+     *       either dispatch to helper now or stash
+     *       {@link #pendingGGInstall} and prompt the helper-APK installer.</li>
+     *   <li>{@code ADD_TO_HELPER}: only helper side runs (main already has
+     *       GG; no need to stomp its data).</li>
+     *   <li>{@code ADD_TO_MAIN}: only main side runs.</li>
+     * </ul>
+     */
+    private void runGuidedGGInstall(String apkPath,
+                                    PackageMetadataReader.ApkInfo info,
+                                    GameGuardianHint.State state) {
+        final boolean doMain = state == GameGuardianHint.State.FRESH
+                || state == GameGuardianHint.State.REINSTALL_BOTH
+                || state == GameGuardianHint.State.ADD_TO_MAIN;
+        final boolean doHelper = state == GameGuardianHint.State.FRESH
+                || state == GameGuardianHint.State.REINSTALL_BOTH
+                || state == GameGuardianHint.State.ADD_TO_HELPER;
+
+        if (doMain) {
+            boolean success = installManager.installApk(apkPath);
+            runOnUiThread(() -> {
+                Toast.makeText(this, success
+                                ? getString(R.string.app_installed,
+                                        info.appName + " (64-bit space)")
+                                : getString(R.string.error_install_failed),
+                        Toast.LENGTH_SHORT).show();
+                loadClonedApps();
+            });
+        }
+
+        if (doHelper) {
+            if (HelperPackage.isInstalled(this)) {
+                dispatchSingleApkToHelper(apkPath, info.packageName, info.appName);
+            } else {
+                // Stage the helper-side dispatch now so we don't have to
+                // re-stage after the helper is installed (the source APK in
+                // apk_staging/ may be reaped). stageForHelper copies to
+                // externalCache which survives an Activity backgrounding.
+                String staged = stageForHelper(apkPath, info.packageName);
+                if (staged == null) {
+                    runOnUiThread(() -> Toast.makeText(this,
+                            getString(R.string.error_install_failed),
+                            Toast.LENGTH_SHORT).show());
+                    return;
+                }
+                pendingGGInstall = new PendingGGInstall(
+                        staged, info.packageName, info.appName);
+                runOnUiThread(() -> promptInstallHelper(
+                        info.appName + " (32-bit space)"));
+            }
+        }
+    }
+
+    private boolean isPackagePresentInMain(String packageName) {
+        if (packageName == null) return false;
+        try {
+            java.util.List<ClonedApp> mainApps = engineBridge.getInstalledApps();
+            if (mainApps == null) return false;
+            for (ClonedApp a : mainApps) {
+                if (packageName.equals(a.getPackageName())) return true;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "isPackagePresentInMain failed: " + e.getMessage());
+        }
+        return false;
+    }
+
+    private boolean isPackagePresentInHelper(String packageName) {
+        if (packageName == null) return false;
+        if (!HelperPackage.isInstalled(this)) return false;
+        try (Cursor c = getContentResolver().query(
+                HelperPackage.INSTALLED_URI, null, null, null, null)) {
+            if (c == null) return false;
+            int pkgIdx = c.getColumnIndex("package_name");
+            if (pkgIdx < 0) return false;
+            while (c.moveToNext()) {
+                if (packageName.equals(c.getString(pkgIdx))) return true;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "isPackagePresentInHelper failed: " + e.getMessage());
+        }
+        return false;
+    }
+
     /**
      * Stage a single APK, build a FileProvider URI, grant it to the helper,
      * and fire the install broadcast. Caller has already decided the helper
@@ -335,6 +547,46 @@ public class MainActivity extends AppCompatActivity implements ImportDialogFragm
         boolean installInMain = abi.is64BitOnly() || abi.hasNoNative() || abi.isMixed();
         boolean installInHelper = abi.is32BitOnly() || abi.isMixed();
         final String safeName = displayName != null ? displayName : "bundle.xapk";
+
+        // v1.0.2: if the bundle's filename hints at GameGuardian AND it carries
+        // both ABIs (the realistic GG packaging), surface the mode-picking
+        // hint before the dual install runs. This is a weak signal — the
+        // authoritative GG identification happens on the APK path via
+        // PackageMetadataReader — so a mis-hit here only shows an advisory
+        // dialog. The dual install proceeds identically to v1.0.1 regardless
+        // of which button the user taps.
+        if (installInMain && installInHelper
+                && GameGuardianHint.filenameLooksLikeGameGuardian(safeName)) {
+            final String bundlePathFinal = bundlePath;
+            final VirtualAbiResolver.AbiInfo abiFinal = abi;
+            runOnUiThread(() -> new com.google.android.material.dialog
+                    .MaterialAlertDialogBuilder(this)
+                    .setTitle(GameGuardianHint.DIALOG_TITLE)
+                    .setMessage(GameGuardianHint.messageFor(
+                            GameGuardianHint.State.FRESH))
+                    .setPositiveButton(R.string.ok,
+                            (d, w) -> new Thread(() -> continueBundleDualInstall(
+                                    bundlePathFinal, abiFinal, safeName)).start())
+                    .setOnCancelListener(d -> new Thread(() -> continueBundleDualInstall(
+                            bundlePathFinal, abiFinal, safeName)).start())
+                    .show());
+            return;
+        }
+
+        continueBundleDualInstall(bundlePath, abi, safeName);
+    }
+
+    /**
+     * v1.0.1 dual-ABI bundle install policy, lifted verbatim. Extracted so
+     * the guided-GG bundle path ({@link #installBundleByAbi}) can invoke it
+     * after the advisory dialog. MUST stay byte-identical to v1.0.1 for all
+     * non-GG bundles.
+     */
+    private void continueBundleDualInstall(String bundlePath,
+                                           VirtualAbiResolver.AbiInfo abi,
+                                           String safeName) {
+        boolean installInMain = abi.is64BitOnly() || abi.hasNoNative() || abi.isMixed();
+        boolean installInHelper = abi.is32BitOnly() || abi.isMixed();
 
         if (installInHelper) {
             if (!HelperPackage.isInstalled(this)) {
