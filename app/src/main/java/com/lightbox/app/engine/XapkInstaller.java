@@ -35,18 +35,15 @@ import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
  *   - APKS (bundletool): ZIP with splits/base-master.apk + splits/base-*.apk.
  *   - APKM (APKMirror): same shape as XAPK.
  *
- * Flow:
+ * Flow (v2 — staging-dir-safe):
  *   1. Extract the ZIP into a staging directory (zip-slip guarded).
  *   2. Pick the base APK — prefer an APK whose parsed packageName matches
  *      manifest.json, otherwise the largest non-config APK.
- *   3. Install the base via the engine.
- *   4. Copy compatible split APKs to <virtualAppDir>/splits/ and persist
- *      their paths in BPackageSettings.splitCodePaths (NOT install them
- *      as independent packages — the engine's PackageParser rejects them).
- *   5. Extract native libs from ABI-compatible splits.
- *   6. Copy Unity IL2CPP metadata fallback from any split that contains it.
- *   7. Copy .obb expansions and Android/data payloads to virtual storage.
- *   8. Clean up the staging directory.
+ *   3. Copy base APK to a temp file OUTSIDE staging.
+ *   4. Persist split APKs + OBBs + Android payloads from staging.
+ *   5. DELETE the staging directory (prevents system PM from scanning splits).
+ *   6. Install the base APK from the temp file.
+ *   7. Clean up the temp file.
  *
  * CRITICAL: Do NOT call installPackageAsUser / installApk for config/split
  * APKs. They are not standalone APKs and will fail with
@@ -126,6 +123,7 @@ public class XapkInstaller {
             return Result.failure("Could not create staging dir: " + stagingDir);
         }
 
+        File tempBase = null;
         try {
             extractZip(bundleFile, stagingDir);
 
@@ -206,22 +204,33 @@ public class XapkInstaller {
             Log.i(TAG, "Installing bundle — base=" + baseApk.getName()
                     + " splits=" + splitApks.size() + " obbs=" + obbFiles.size());
 
-            // ── Step 1: Install base APK ──
-            if (!engineBridge.installApk(baseApk.getAbsolutePath())) {
-                return Result.failure("Base APK install rejected by engine");
-            }
+            // ── Step 1: Copy base APK to temp file OUTSIDE staging ──
+            // The system PackageManager may scan the staging directory and
+            // attempt to parse split APKs as standalone packages, causing
+            // "Expected base APK, but found split" errors.
+            tempBase = new File(context.getFilesDir(),
+                    "xapk_base_" + System.currentTimeMillis() + ".apk");
+            copyFile(baseApk, tempBase);
 
-            PackageMetadataReader.ApkInfo info =
-                    PackageMetadataReader.readApkInfo(context, baseApk.getAbsolutePath());
-            String packageName = info != null ? info.packageName : declaredPackage;
-            String appName = info != null && info.appName != null
-                    ? info.appName
-                    : (declaredAppName != null ? declaredAppName : packageName);
+            // ── Step 2: Pre-resolve package name from manifest or APK ──
+            // We need the package name before install to persist splits.
+            // Try manifest first, then fall back to parsing the base APK.
+            String packageName = declaredPackage;
+            String appName = declaredAppName;
             if (packageName == null) {
-                return Result.failure("Bundle installed but package name is unknown");
+                PackageMetadataReader.ApkInfo info =
+                        PackageMetadataReader.readApkInfo(context, baseApk.getAbsolutePath());
+                if (info != null) {
+                    packageName = info.packageName;
+                    if (info.appName != null) appName = info.appName;
+                }
+            }
+            if (packageName == null) {
+                return Result.failure("Could not determine package name from bundle");
             }
 
-            // ── Step 2: Persist split APKs under <virtualAppDir>/splits/ ──
+            // ── Step 3: Persist split APKs + OBBs from staging ──
+            // These operations read from the staging dir, so do them before cleanup.
             File virtualAppDir = BEnvironment.getAppDir(packageName);
             File splitDir = new File(virtualAppDir, "splits");
             if (!splitDir.exists() && !splitDir.mkdirs()) {
@@ -256,12 +265,10 @@ public class XapkInstaller {
                 } catch (Exception e) {
                     Log.w(TAG, "Failed to persist split " + split.getName()
                             + ": " + e.getMessage());
-                    // For ABI splits, this is critical
                     if (isAbiSplit(n)) {
                         return Result.failure("Failed to persist ABI split: "
                                 + split.getName());
                     }
-                    // For locale/density splits, continue
                     continue;
                 }
 
@@ -276,7 +283,7 @@ public class XapkInstaller {
                 copyUnityIl2CppMetadataIfPresent(dst, packageName);
             }
 
-            // ── Step 3: Persist split paths in BPackageSettings ──
+            // Persist split paths in BPackageSettings
             if (!persistedSplitPaths.isEmpty()) {
                 try {
                     BPackageManagerService pmService = BPackageManagerService.get();
@@ -299,20 +306,34 @@ public class XapkInstaller {
                 }
             }
 
-            // ── Step 4: Copy OBB files to virtual storage ──
+            // Copy OBB files
             if (!obbFiles.isEmpty()) {
                 copyObbs(packageName, obbFiles);
             }
 
-            // ── Step 5: Copy Android/data and Android/obb from XAPK ──
+            // Copy Android/data and Android/obb payloads from XAPK
             extractAndroidPayloads(bundleFile, packageName);
 
-            return Result.success(packageName, appName);
+            // ── Step 4: Delete staging directory BEFORE installing ──
+            // This prevents the system PackageManager from scanning split APKs.
+            deleteRecursive(stagingDir);
+            stagingDir = null;
+
+            // ── Step 5: Install base APK from temp file ──
+            boolean installed = engineBridge.installApk(tempBase.getAbsolutePath());
+            if (!installed) {
+                return Result.failure("Base APK install rejected by engine");
+            }
+
+            return Result.success(packageName, appName != null ? appName : packageName);
         } catch (Exception e) {
             Log.e(TAG, "XAPK install failed", e);
             return Result.failure(e.getMessage() != null ? e.getMessage() : e.toString());
         } finally {
-            deleteRecursive(stagingDir);
+            // Clean up staging if still exists
+            if (stagingDir != null) deleteRecursive(stagingDir);
+            // Clean up temp base APK
+            if (tempBase != null && tempBase.exists()) tempBase.delete();
         }
     }
 
@@ -431,16 +452,13 @@ public class XapkInstaller {
     }
 
     // ────────────────────────────────────────────────────────────
-    // Unity IL2CPP metadata fallback (Fix 5)
+    // Unity IL2CPP metadata fallback
     // ────────────────────────────────────────────────────────────
 
     /**
      * If a split APK contains Unity IL2CPP metadata under any path ending
      * in global-metadata.dat, copy it to the virtual external files directory
      * where Unity expects to find it at runtime.
-     *
-     * This fixes Bus Simulator Indonesia and other Unity IL2CPP games that
-     * crash with: "IL2CPP ERROR: Could not open .../il2cpp/Metadata/global-metadata.dat"
      */
     private void copyUnityIl2CppMetadataIfPresent(File splitApk, String packageName) {
         final String metadataSuffix = "global-metadata.dat";
@@ -481,18 +499,9 @@ public class XapkInstaller {
         }
     }
 
-    /**
-     * Resolve the virtual external files directory for a package.
-     * Maps to the same virtual storage root LightBox-NG exposes to apps.
-     * Uses BEnvironment helpers when available; falls back to the path
-     * pattern from the crash log.
-     */
     private File getVirtualExternalFilesDir(String packageName) {
         try {
-            // Use BEnvironment if available
             File dataDir = BEnvironment.getDataDir(packageName, 0);
-            // Virtual external storage pattern:
-            // <host-external>/Android/data/<hostPkg>/files/blackbox/storage/emulated/0/Android/data/<pkg>/files
             File hostExternal = context.getExternalFilesDir(null);
             if (hostExternal != null) {
                 File androidData = hostExternal.getParentFile().getParentFile();
@@ -507,18 +516,13 @@ public class XapkInstaller {
         } catch (Exception e) {
             Log.w(TAG, "Could not resolve virtual external files dir: " + e.getMessage());
         }
-        // Fallback
         return context.getExternalFilesDir(null);
     }
 
     // ────────────────────────────────────────────────────────────
-    // Android/data and Android/obb payloads from XAPK (Fix 6)
+    // Android/data and Android/obb payloads from XAPK
     // ────────────────────────────────────────────────────────────
 
-    /**
-     * Extract Android/obb/<pkg>/** and Android/data/<pkg>/** entries
-     * from the XAPK ZIP and copy them to the virtual storage paths.
-     */
     private void extractAndroidPayloads(File xapkFile, String packageName) {
         try {
             File hostExternal = context.getExternalFilesDir(null);
@@ -535,13 +539,11 @@ public class XapkInstaller {
                     if (entry.isDirectory()) continue;
                     String name = entry.getName();
 
-                    // Match Android/obb/<packageName>/** or Android/data/<packageName>/**
                     boolean isObb = name.startsWith("Android/obb/" + packageName + "/");
                     boolean isData = name.startsWith("Android/data/" + packageName + "/");
 
                     if (!isObb && !isData) continue;
 
-                    // Validate: prevent path traversal
                     File outFile = safeResolve(virtualStorageRoot, name);
                     if (outFile == null) continue;
 
@@ -669,7 +671,7 @@ public class XapkInstaller {
             if (c.isFile() && c.getName().toLowerCase(Locale.ROOT).endsWith(lower)) {
                 out.add(c);
             } else if (c.isDirectory()) {
-                out.addAll(collectFilesBySuffix(c, suffix));
+                out.addAll(collectFilesBySuffix(c, lower));
             }
         }
         return out;
