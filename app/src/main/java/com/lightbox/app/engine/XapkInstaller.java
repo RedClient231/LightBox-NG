@@ -796,7 +796,7 @@ public class XapkInstaller {
                 try {
                     p.unmarshall(bytes, 0, bytes.length);
                     p.setDataPosition(0);
-                    BPackageSettings ps = new BPackageSettings(p);
+                    BPackageSettings ps = BPackageSettings.CREATOR.createFromParcel(p);
                     ps.splitCodePaths = new ArrayList<>(splitPaths);
                     ps.splitNames = new ArrayList<>(splitNames);
                     ps.save();
