@@ -209,11 +209,18 @@ public class XapkInstaller {
             Log.i(TAG, "Installing bundle — base=" + baseApk.getName()
                     + " splits=" + splitApks.size() + " obbs=" + obbFiles.size());
 
-            // ── Step 1: Install base APK ──
-            if (!engineBridge.installApk(baseApk.getAbsolutePath())) {
-                return Result.failure("Base APK install rejected by engine");
-            }
+            // ── Step 0: Copy base APK to temp file OUTSIDE staging ──
+            // The system PackageManager scans the staging directory and tries
+            // to parse split APKs as standalone packages, causing
+            // "Expected base APK, but found split" errors. By copying the
+            // base APK to a temp file and deleting staging BEFORE install,
+            // we eliminate the window where splits are visible.
+            File tempBase = new File(context.getFilesDir(),
+                    "xapk_base_" + System.currentTimeMillis() + ".apk");
+            copyFile(baseApk, tempBase);
 
+            // ── Step 1: Resolve package name before install ──
+            // We need the package name to persist splits and OBBs.
             PackageMetadataReader.ApkInfo info =
                     PackageMetadataReader.readApkInfo(context, baseApk.getAbsolutePath());
             String packageName = info != null ? info.packageName : declaredPackage;
@@ -221,10 +228,12 @@ public class XapkInstaller {
                     ? info.appName
                     : (declaredAppName != null ? declaredAppName : packageName);
             if (packageName == null) {
-                return Result.failure("Bundle installed but package name is unknown");
+                tempBase.delete();
+                return Result.failure("Could not determine package name from bundle");
             }
 
-            // ── Step 2: Persist split APKs under <virtualAppDir>/splits/ ──
+            // ── Step 2: Persist splits + OBBs from staging ──
+            // These read from staging, so do them before cleanup.
             File virtualAppDir = BEnvironment.getAppDir(packageName);
             File splitDir = new File(virtualAppDir, "splits");
             if (!splitDir.exists() && !splitDir.mkdirs()) {
@@ -243,13 +252,11 @@ public class XapkInstaller {
                         || n.startsWith("split_config.")
                         || n.contains(".config.");
 
-                // Select only compatible splits
                 if (configSplit && !isCompatibleSplit(split, deviceAbis)) {
                     Log.i(TAG, "Skipping incompatible split: " + split.getName());
                     continue;
                 }
 
-                // Copy split to persistent dir
                 File dst = new File(splitDir, sanitizeSplitFileName(split.getName()));
                 try {
                     copyFile(split, dst);
@@ -259,49 +266,56 @@ public class XapkInstaller {
                 } catch (Exception e) {
                     Log.w(TAG, "Failed to persist split " + split.getName()
                             + ": " + e.getMessage());
-                    // For ABI splits, this is critical
                     if (isAbiSplit(n)) {
+                        tempBase.delete();
                         return Result.failure("Failed to persist ABI split: "
                                 + split.getName());
                     }
-                    // For locale/density splits, continue
                     continue;
                 }
 
-                // Extract native libs from this split
                 if (configSplit) {
                     int extracted = extractNativeLibsFromConfigSplit(split, packageName);
                     Log.i(TAG, "Extracted " + extracted + " .so from config split: "
                             + split.getName());
                 }
 
-                // Unity IL2CPP metadata fallback
                 copyUnityIl2CppMetadataIfPresent(dst, packageName);
             }
 
-            // ── Step 3: Persist split paths in BPackageSettings ──
-            // NOTE: BPackageManagerService.get() returns a per-process static singleton.
-            // The install happens via Binder in the server process, so the caller
-            // process's mPackages map is empty. We must read package.conf from disk
-            // instead of relying on the in-memory singleton.
+            // Persist split paths to disk
             if (!persistedSplitPaths.isEmpty()) {
                 persistSplitPathsToDisk(packageName, persistedSplitPaths, persistedSplitNames);
             }
 
-            // ── Step 3b: Pre-create virtual external storage directories ──
-            // Many apps (UE4 games, Unity with GCloud SDK) crash if their
-            // cache/files directories don't exist in virtual storage.
+            // Pre-create virtual external storage directories
             ensureVirtualExternalDirs(packageName);
 
-            // ── Step 4: Copy OBB files to virtual storage ──
+            // Copy OBB files
             if (!obbFiles.isEmpty()) {
                 copyObbs(packageName, obbFiles);
             }
 
-            // ── Step 5: Copy Android/data and Android/obb from XAPK ──
+            // Copy Android/data and Android/obb payloads from XAPK
             extractAndroidPayloads(bundleFile, packageName);
 
-            return Result.success(packageName, appName);
+            // ── Step 3: DELETE staging directory BEFORE installing ──
+            // This prevents the system PackageManager from scanning splits.
+            deleteRecursive(stagingDir);
+            stagingDir = null;
+
+            // ── Step 4: Install base APK from temp file ──
+            boolean installed;
+            try {
+                installed = engineBridge.installApk(tempBase.getAbsolutePath());
+            } finally {
+                tempBase.delete();
+            }
+            if (!installed) {
+                return Result.failure("Base APK install rejected by engine");
+            }
+
+            return Result.success(packageName, appName != null ? appName : packageName);
         } catch (Exception e) {
             Log.e(TAG, "XAPK install failed", e);
             return Result.failure(e.getMessage() != null ? e.getMessage() : e.toString());
