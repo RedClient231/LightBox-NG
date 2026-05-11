@@ -7,6 +7,8 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import android.os.Parcel;
+
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -25,6 +27,7 @@ import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.core.env.BEnvironment;
 import top.niunaijun.blackbox.core.system.pm.BPackageSettings;
 import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
+import top.niunaijun.blackbox.utils.FileUtils;
 
 /**
  * Extracts and installs XAPK / APKS / APKM bundles.
@@ -35,15 +38,18 @@ import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
  *   - APKS (bundletool): ZIP with splits/base-master.apk + splits/base-*.apk.
  *   - APKM (APKMirror): same shape as XAPK.
  *
- * Flow (v2 — staging-dir-safe):
+ * Flow:
  *   1. Extract the ZIP into a staging directory (zip-slip guarded).
  *   2. Pick the base APK — prefer an APK whose parsed packageName matches
  *      manifest.json, otherwise the largest non-config APK.
- *   3. Copy base APK to a temp file OUTSIDE staging.
- *   4. Persist split APKs + OBBs + Android payloads from staging.
- *   5. DELETE the staging directory (prevents system PM from scanning splits).
- *   6. Install the base APK from the temp file.
- *   7. Clean up the temp file.
+ *   3. Install the base via the engine.
+ *   4. Copy compatible split APKs to <virtualAppDir>/splits/ and persist
+ *      their paths in BPackageSettings.splitCodePaths (NOT install them
+ *      as independent packages — the engine's PackageParser rejects them).
+ *   5. Extract native libs from ABI-compatible splits.
+ *   6. Copy Unity IL2CPP metadata fallback from any split that contains it.
+ *   7. Copy .obb expansions and Android/data payloads to virtual storage.
+ *   8. Clean up the staging directory.
  *
  * CRITICAL: Do NOT call installPackageAsUser / installApk for config/split
  * APKs. They are not standalone APKs and will fail with
@@ -123,7 +129,6 @@ public class XapkInstaller {
             return Result.failure("Could not create staging dir: " + stagingDir);
         }
 
-        File tempBase = null;
         try {
             extractZip(bundleFile, stagingDir);
 
@@ -204,33 +209,22 @@ public class XapkInstaller {
             Log.i(TAG, "Installing bundle — base=" + baseApk.getName()
                     + " splits=" + splitApks.size() + " obbs=" + obbFiles.size());
 
-            // ── Step 1: Copy base APK to temp file OUTSIDE staging ──
-            // The system PackageManager may scan the staging directory and
-            // attempt to parse split APKs as standalone packages, causing
-            // "Expected base APK, but found split" errors.
-            tempBase = new File(context.getFilesDir(),
-                    "xapk_base_" + System.currentTimeMillis() + ".apk");
-            copyFile(baseApk, tempBase);
-
-            // ── Step 2: Pre-resolve package name from manifest or APK ──
-            // We need the package name before install to persist splits.
-            // Try manifest first, then fall back to parsing the base APK.
-            String packageName = declaredPackage;
-            String appName = declaredAppName;
-            if (packageName == null) {
-                PackageMetadataReader.ApkInfo info =
-                        PackageMetadataReader.readApkInfo(context, baseApk.getAbsolutePath());
-                if (info != null) {
-                    packageName = info.packageName;
-                    if (info.appName != null) appName = info.appName;
-                }
-            }
-            if (packageName == null) {
-                return Result.failure("Could not determine package name from bundle");
+            // ── Step 1: Install base APK ──
+            if (!engineBridge.installApk(baseApk.getAbsolutePath())) {
+                return Result.failure("Base APK install rejected by engine");
             }
 
-            // ── Step 3: Persist split APKs + OBBs from staging ──
-            // These operations read from the staging dir, so do them before cleanup.
+            PackageMetadataReader.ApkInfo info =
+                    PackageMetadataReader.readApkInfo(context, baseApk.getAbsolutePath());
+            String packageName = info != null ? info.packageName : declaredPackage;
+            String appName = info != null && info.appName != null
+                    ? info.appName
+                    : (declaredAppName != null ? declaredAppName : packageName);
+            if (packageName == null) {
+                return Result.failure("Bundle installed but package name is unknown");
+            }
+
+            // ── Step 2: Persist split APKs under <virtualAppDir>/splits/ ──
             File virtualAppDir = BEnvironment.getAppDir(packageName);
             File splitDir = new File(virtualAppDir, "splits");
             if (!splitDir.exists() && !splitDir.mkdirs()) {
@@ -265,10 +259,12 @@ public class XapkInstaller {
                 } catch (Exception e) {
                     Log.w(TAG, "Failed to persist split " + split.getName()
                             + ": " + e.getMessage());
+                    // For ABI splits, this is critical
                     if (isAbiSplit(n)) {
                         return Result.failure("Failed to persist ABI split: "
                                 + split.getName());
                     }
+                    // For locale/density splits, continue
                     continue;
                 }
 
@@ -283,57 +279,34 @@ public class XapkInstaller {
                 copyUnityIl2CppMetadataIfPresent(dst, packageName);
             }
 
-            // Persist split paths in BPackageSettings
+            // ── Step 3: Persist split paths in BPackageSettings ──
+            // NOTE: BPackageManagerService.get() returns a per-process static singleton.
+            // The install happens via Binder in the server process, so the caller
+            // process's mPackages map is empty. We must read package.conf from disk
+            // instead of relying on the in-memory singleton.
             if (!persistedSplitPaths.isEmpty()) {
-                try {
-                    BPackageManagerService pmService = BPackageManagerService.get();
-                    if (pmService != null) {
-                        BPackageSettings ps = pmService.getBPackageSetting(packageName);
-                        if (ps != null) {
-                            ps.splitCodePaths = new ArrayList<>(persistedSplitPaths);
-                            ps.splitNames = new ArrayList<>(persistedSplitNames);
-                            ps.save();
-                            Log.i(TAG, "Saved " + persistedSplitPaths.size()
-                                    + " split paths for " + packageName);
-                        } else {
-                            Log.w(TAG, "BPackageSettings not found for " + packageName
-                                    + "; split paths not persisted");
-                        }
-                    }
-                } catch (Exception e) {
-                    Log.w(TAG, "Failed to persist split paths in BPackageSettings: "
-                            + e.getMessage());
-                }
+                persistSplitPathsToDisk(packageName, persistedSplitPaths, persistedSplitNames);
             }
 
-            // Copy OBB files
+            // ── Step 3b: Pre-create virtual external storage directories ──
+            // Many apps (UE4 games, Unity with GCloud SDK) crash if their
+            // cache/files directories don't exist in virtual storage.
+            ensureVirtualExternalDirs(packageName);
+
+            // ── Step 4: Copy OBB files to virtual storage ──
             if (!obbFiles.isEmpty()) {
                 copyObbs(packageName, obbFiles);
             }
 
-            // Copy Android/data and Android/obb payloads from XAPK
+            // ── Step 5: Copy Android/data and Android/obb from XAPK ──
             extractAndroidPayloads(bundleFile, packageName);
 
-            // ── Step 4: Delete staging directory BEFORE installing ──
-            // This prevents the system PackageManager from scanning split APKs.
-            deleteRecursive(stagingDir);
-            stagingDir = null;
-
-            // ── Step 5: Install base APK from temp file ──
-            boolean installed = engineBridge.installApk(tempBase.getAbsolutePath());
-            if (!installed) {
-                return Result.failure("Base APK install rejected by engine");
-            }
-
-            return Result.success(packageName, appName != null ? appName : packageName);
+            return Result.success(packageName, appName);
         } catch (Exception e) {
             Log.e(TAG, "XAPK install failed", e);
             return Result.failure(e.getMessage() != null ? e.getMessage() : e.toString());
         } finally {
-            // Clean up staging if still exists
-            if (stagingDir != null) deleteRecursive(stagingDir);
-            // Clean up temp base APK
-            if (tempBase != null && tempBase.exists()) tempBase.delete();
+            deleteRecursive(stagingDir);
         }
     }
 
@@ -452,13 +425,16 @@ public class XapkInstaller {
     }
 
     // ────────────────────────────────────────────────────────────
-    // Unity IL2CPP metadata fallback
+    // Unity IL2CPP metadata fallback (Fix 5)
     // ────────────────────────────────────────────────────────────
 
     /**
      * If a split APK contains Unity IL2CPP metadata under any path ending
      * in global-metadata.dat, copy it to the virtual external files directory
      * where Unity expects to find it at runtime.
+     *
+     * This fixes Bus Simulator Indonesia and other Unity IL2CPP games that
+     * crash with: "IL2CPP ERROR: Could not open .../il2cpp/Metadata/global-metadata.dat"
      */
     private void copyUnityIl2CppMetadataIfPresent(File splitApk, String packageName) {
         final String metadataSuffix = "global-metadata.dat";
@@ -476,32 +452,56 @@ public class XapkInstaller {
             }
             if (match == null) return;
 
-            File filesDir = getVirtualExternalFilesDir(packageName);
-            File metadataDir = new File(filesDir, "il2cpp/Metadata");
-            if (!metadataDir.exists() && !metadataDir.mkdirs()) {
-                Log.w(TAG, "Could not create IL2CPP metadata dir: " + metadataDir);
-                return;
+            byte[] data;
+            try (InputStream in = zip.getInputStream(match)) {
+                data = readAllBytes(in);
             }
-            File out = new File(metadataDir, "global-metadata.dat");
 
-            try (InputStream in = zip.getInputStream(match);
-                 OutputStream os = new BufferedOutputStream(new FileOutputStream(out))) {
-                byte[] buf = new byte[256 * 1024];
-                int read;
-                while ((read = in.read(buf)) != -1) {
-                    os.write(buf, 0, read);
-                }
+            // Copy to EXTERNAL virtual storage (Unity's primary search path)
+            File extFilesDir = getVirtualExternalFilesDir(packageName);
+            File extMetadataDir = new File(extFilesDir, "il2cpp/Metadata");
+            if (!extMetadataDir.exists() && !extMetadataDir.mkdirs()) {
+                Log.w(TAG, "Could not create external IL2CPP metadata dir: " + extMetadataDir);
+            } else {
+                File extOut = new File(extMetadataDir, "global-metadata.dat");
+                writeBytes(extOut, data);
+                Log.i(TAG, "Copied Unity IL2CPP metadata from " + splitApk.getName()
+                        + " to " + extOut.getAbsolutePath());
             }
-            Log.i(TAG, "Copied Unity IL2CPP metadata from " + splitApk.getName()
-                    + " to " + out.getAbsolutePath());
+
+            // Copy to INTERNAL virtual data dir (more reliable path redirect)
+            // Unity also checks getFilesDir()/il2cpp/Metadata/ which maps to
+            // the internal data dir redirected by IOCore.
+            try {
+                File intFilesDir = BEnvironment.getDataFilesDir(packageName, 0);
+                File intMetadataDir = new File(intFilesDir, "il2cpp/Metadata");
+                if (!intMetadataDir.exists() && !intMetadataDir.mkdirs()) {
+                    Log.w(TAG, "Could not create internal IL2CPP metadata dir: " + intMetadataDir);
+                } else {
+                    File intOut = new File(intMetadataDir, "global-metadata.dat");
+                    writeBytes(intOut, data);
+                    Log.i(TAG, "Copied Unity IL2CPP metadata to internal: " + intOut.getAbsolutePath());
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to copy IL2CPP metadata to internal dir: " + e.getMessage());
+            }
         } catch (IOException e) {
             Log.w(TAG, "Unable to scan/copy Unity metadata from split: " + splitApk, e);
         }
     }
 
+    /**
+     * Resolve the virtual external files directory for a package.
+     * Maps to the same virtual storage root LightBox-NG exposes to apps.
+     * Uses BEnvironment helpers when available; falls back to the path
+     * pattern from the crash log.
+     */
     private File getVirtualExternalFilesDir(String packageName) {
         try {
+            // Use BEnvironment if available
             File dataDir = BEnvironment.getDataDir(packageName, 0);
+            // Virtual external storage pattern:
+            // <host-external>/Android/data/<hostPkg>/files/blackbox/storage/emulated/0/Android/data/<pkg>/files
             File hostExternal = context.getExternalFilesDir(null);
             if (hostExternal != null) {
                 File androidData = hostExternal.getParentFile().getParentFile();
@@ -516,13 +516,18 @@ public class XapkInstaller {
         } catch (Exception e) {
             Log.w(TAG, "Could not resolve virtual external files dir: " + e.getMessage());
         }
+        // Fallback
         return context.getExternalFilesDir(null);
     }
 
     // ────────────────────────────────────────────────────────────
-    // Android/data and Android/obb payloads from XAPK
+    // Android/data and Android/obb payloads from XAPK (Fix 6)
     // ────────────────────────────────────────────────────────────
 
+    /**
+     * Extract Android/obb/<pkg>/** and Android/data/<pkg>/** entries
+     * from the XAPK ZIP and copy them to the virtual storage paths.
+     */
     private void extractAndroidPayloads(File xapkFile, String packageName) {
         try {
             File hostExternal = context.getExternalFilesDir(null);
@@ -539,11 +544,13 @@ public class XapkInstaller {
                     if (entry.isDirectory()) continue;
                     String name = entry.getName();
 
+                    // Match Android/obb/<packageName>/** or Android/data/<packageName>/**
                     boolean isObb = name.startsWith("Android/obb/" + packageName + "/");
                     boolean isData = name.startsWith("Android/data/" + packageName + "/");
 
                     if (!isObb && !isData) continue;
 
+                    // Validate: prevent path traversal
                     File outFile = safeResolve(virtualStorageRoot, name);
                     if (outFile == null) continue;
 
@@ -671,7 +678,7 @@ public class XapkInstaller {
             if (c.isFile() && c.getName().toLowerCase(Locale.ROOT).endsWith(lower)) {
                 out.add(c);
             } else if (c.isDirectory()) {
-                out.addAll(collectFilesBySuffix(c, lower));
+                out.addAll(collectFilesBySuffix(c, suffix));
             }
         }
         return out;
@@ -734,5 +741,134 @@ public class XapkInstaller {
             if (children != null) for (File c : children) deleteRecursive(c);
         }
         fileOrDir.delete();
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // BPackageSettings disk persistence (cross-process safe)
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * Persist split APK paths into BPackageSettings by reading the
+     * package.conf from disk (not from the per-process singleton).
+     *
+     * The install runs via Binder in the server process, so the caller's
+     * BPackageManagerService.mPackages is empty. The server process writes
+     * package.conf after install; we re-read it, add our split paths,
+     * and save it back atomically.
+     */
+    private void persistSplitPathsToDisk(String packageName,
+                                          List<String> splitPaths,
+                                          List<String> splitNames) {
+        try {
+            // First try the per-process singleton (works if we're in the server process)
+            BPackageManagerService pmService = BPackageManagerService.get();
+            if (pmService != null) {
+                BPackageSettings ps = pmService.getBPackageSetting(packageName);
+                if (ps != null) {
+                    ps.splitCodePaths = new ArrayList<>(splitPaths);
+                    ps.splitNames = new ArrayList<>(splitNames);
+                    ps.save();
+                    Log.i(TAG, "Saved " + splitPaths.size()
+                            + " split paths for " + packageName + " (in-process)");
+                    return;
+                }
+            }
+
+            // Fallback: read package.conf from disk, merge split paths, save back
+            File confFile = BEnvironment.getPackageConf(packageName);
+            if (confFile != null && confFile.exists()) {
+                byte[] bytes = FileUtils.toByteArray(confFile);
+                Parcel p = Parcel.obtain();
+                try {
+                    p.unmarshall(bytes, 0, bytes.length);
+                    p.setDataPosition(0);
+                    BPackageSettings ps = new BPackageSettings(p);
+                    ps.splitCodePaths = new ArrayList<>(splitPaths);
+                    ps.splitNames = new ArrayList<>(splitNames);
+                    ps.save();
+                    Log.i(TAG, "Saved " + splitPaths.size()
+                            + " split paths for " + packageName + " (via disk)");
+                } finally {
+                    p.recycle();
+                }
+            } else {
+                Log.w(TAG, "package.conf not found for " + packageName
+                        + "; split paths not persisted. Conf path: " + confFile);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to persist split paths for " + packageName
+                    + ": " + e.getMessage());
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Virtual external storage directory pre-creation
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * Pre-create the virtual external storage directories that apps
+     * expect to exist. UE4 games (Gangstar Vegas) and Unity games
+     * with GCloud SDK crash if their cache/files directories don't
+     * exist in virtual storage because the native IO hooks intercept
+     * mkdir() calls but may not handle them correctly for deep paths.
+     *
+     * Creates:
+     *   - Android/data/<pkg>/files/
+     *   - Android/data/<pkg>/cache/
+     *   - Android/data/<pkg>/files/il2cpp/Metadata/
+     *   - Android/obb/<pkg>/
+     */
+    private void ensureVirtualExternalDirs(String packageName) {
+        try {
+            File hostExternal = context.getExternalFilesDir(null);
+            if (hostExternal == null) return;
+            File androidRoot = hostExternal.getParentFile().getParentFile();
+            String virtualBase = context.getPackageName()
+                    + "/files/blackbox/storage/emulated/0";
+
+            String[] dirs = {
+                    virtualBase + "/Android/data/" + packageName + "/files",
+                    virtualBase + "/Android/data/" + packageName + "/cache",
+                    virtualBase + "/Android/data/" + packageName + "/files/il2cpp/Metadata",
+                    virtualBase + "/Android/obb/" + packageName,
+            };
+
+            for (String dirPath : dirs) {
+                File dir = new File(androidRoot, dirPath);
+                if (!dir.exists()) {
+                    if (dir.mkdirs()) {
+                        Log.d(TAG, "Pre-created virtual dir: " + dir.getAbsolutePath());
+                    } else {
+                        Log.w(TAG, "Failed to create virtual dir: " + dir.getAbsolutePath());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "ensureVirtualExternalDirs failed: " + e.getMessage());
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Byte-level I/O helpers
+    // ────────────────────────────────────────────────────────────
+
+    private static byte[] readAllBytes(InputStream in) throws IOException {
+        byte[] buf = new byte[256 * 1024];
+        byte[] result = new byte[0];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            byte[] newResult = new byte[result.length + n];
+            System.arraycopy(result, 0, newResult, 0, result.length);
+            System.arraycopy(buf, 0, newResult, result.length, n);
+            result = newResult;
+        }
+        return result;
+    }
+
+    private static void writeBytes(File dest, byte[] data) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(dest)) {
+            fos.write(data);
+        }
+        dest.setReadable(true, false);
     }
 }
